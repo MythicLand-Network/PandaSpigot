@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Sat, 07 Nov 2026 05:28:10 +0000
+Subject: [PATCH] Reuse repeated map palette matches
+
+
+diff --git a/src/main/java/org/bukkit/map/MapPalette.java b/src/main/java/org/bukkit/map/MapPalette.java
+index 3aca081d..48a396b4 100644
+--- a/src/main/java/org/bukkit/map/MapPalette.java
++++ b/src/main/java/org/bukkit/map/MapPalette.java
+@@ -173,8 +173,24 @@ public final class MapPalette {
+         temp.getRGB(0, 0, temp.getWidth(), temp.getHeight(), pixels, 0, temp.getWidth());
+ 
+         byte[] result = new byte[temp.getWidth() * temp.getHeight()];
++        // Flat images such as QR codes repeatedly use the same two colors.
++        int lastPixel = 0;
++        int previousPixel = 0;
++        byte lastColor = TRANSPARENT;
++        byte previousColor = TRANSPARENT;
+         for (int i = 0; i < pixels.length; i++) {
+-            result[i] = matchColor(new Color(pixels[i], true));
++            int pixel = pixels[i];
++            if (pixel == lastPixel) {
++                result[i] = lastColor;
++            } else if (pixel == previousPixel) {
++                result[i] = previousColor;
++            } else {
++                previousPixel = lastPixel;
++                previousColor = lastColor;
++                lastPixel = pixel;
++                lastColor = matchColor(new Color(pixel, true));
++                result[i] = lastColor;
++            }
+         }
+         return result;
+     }
+diff --git a/src/test/java/org/bukkit/map/MapPaletteTest.java b/src/test/java/org/bukkit/map/MapPaletteTest.java
+new file mode 100644
+index 00000000..ab78bd63
+--- /dev/null
++++ b/src/test/java/org/bukkit/map/MapPaletteTest.java
+@@ -0,0 +1,37 @@
++package org.bukkit.map;
++
++import java.awt.Color;
++import java.awt.Graphics2D;
++import java.awt.image.BufferedImage;
++import java.util.Random;
++import org.junit.Test;
++
++import static org.junit.Assert.assertArrayEquals;
++
++public class MapPaletteTest {
++    @Test
++    public void imageConversionPreservesPaletteIndicesAndTransparency() {
++        BufferedImage source = new BufferedImage(128, 128, BufferedImage.TYPE_INT_ARGB);
++        Random random = new Random(48L);
++        int[] repeated = {0xff000000, 0xffffffff, 0xff70a8e0, 0x00000000, 0x7f9da07c, 0x809da07c};
++        for (int y = 0; y < source.getHeight(); y++) {
++            for (int x = 0; x < source.getWidth(); x++) {
++                int argb = y < 64 ? repeated[(x + y) % 2]
++                        : y < 96 ? repeated[(x + y) % repeated.length] : random.nextInt();
++                source.setRGB(x, y, argb);
++            }
++        }
++
++        BufferedImage normalized = new BufferedImage(128, 128, BufferedImage.TYPE_INT_ARGB);
++        Graphics2D graphics = normalized.createGraphics();
++        graphics.drawImage(source, 0, 0, null);
++        graphics.dispose();
++        int[] pixels = normalized.getRGB(0, 0, 128, 128, null, 0, 128);
++        byte[] expected = new byte[pixels.length];
++        for (int i = 0; i < pixels.length; i++) {
++            expected[i] = MapPalette.matchColor(new Color(pixels[i], true));
++        }
++
++        assertArrayEquals(expected, MapPalette.imageToBytes(source));
++    }
++}
