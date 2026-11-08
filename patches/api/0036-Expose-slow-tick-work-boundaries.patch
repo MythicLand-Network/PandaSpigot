@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Thu, 29 Oct 2026 14:34:22 +0800
+Subject: [PATCH] Expose slow tick work boundaries
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/event/server/SlowTickEvent.java b/src/main/java/com/hpfxd/pandaspigot/event/server/SlowTickEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1e529ac0b08097a6d75cb52a818c56769641a62
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/event/server/SlowTickEvent.java
+@@ -0,0 +1,39 @@
++package com.hpfxd.pandaspigot.event.server;
++
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++
++/** Reports a completed tick whose work exceeded 20 milliseconds. */
++public final class SlowTickEvent extends Event {
++    private static final HandlerList HANDLERS = new HandlerList();
++    private final int tick;
++    private final long startNanos;
++    private final long endNanos;
++    private final long workEndNanos;
++    private final long workNanos;
++    private final long[] idleRanges;
++    private final boolean rangesTruncated;
++
++    public SlowTickEvent(int tick, long startNanos, long endNanos, long workEndNanos,
++                         long workNanos, long[] idleRanges, boolean rangesTruncated) {
++        this.tick = tick;
++        this.startNanos = startNanos;
++        this.endNanos = endNanos;
++        this.workEndNanos = workEndNanos;
++        this.workNanos = workNanos;
++        this.idleRanges = idleRanges.clone();
++        this.rangesTruncated = rangesTruncated;
++    }
++
++    public int getTick() { return this.tick; }
++    public long getStartNanos() { return this.startNanos; }
++    public long getEndNanos() { return this.endNanos; }
++    public long getWorkEndNanos() { return this.workEndNanos; }
++    public long getWorkNanos() { return this.workNanos; }
++    /** Alternating start and end timestamps for idle parking, using System.nanoTime(). */
++    public long[] getIdleRanges() { return this.idleRanges.clone(); }
++    public boolean isRangesTruncated() { return this.rangesTruncated; }
++
++    @Override public HandlerList getHandlers() { return HANDLERS; }
++    public static HandlerList getHandlerList() { return HANDLERS; }
++}
+diff --git a/src/main/java/com/hpfxd/pandaspigot/event/server/TickSummaryEvent.java b/src/main/java/com/hpfxd/pandaspigot/event/server/TickSummaryEvent.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a963b30012e07acf96ee5341555fbecbd528989e
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/event/server/TickSummaryEvent.java
+@@ -0,0 +1,25 @@
++package com.hpfxd.pandaspigot.event.server;
++
++import org.bukkit.event.Event;
++import org.bukkit.event.HandlerList;
++
++/** Reports bounded completed-tick work durations for a monitoring interval. */
++public final class TickSummaryEvent extends Event {
++    private static final HandlerList HANDLERS = new HandlerList();
++    private final long elapsedNanos;
++    private final long[] workNanos;
++    private final int totalTicks;
++
++    public TickSummaryEvent(long elapsedNanos, long[] workNanos, int totalTicks) {
++        this.elapsedNanos = elapsedNanos;
++        this.workNanos = workNanos.clone();
++        this.totalTicks = totalTicks;
++    }
++
++    public long getElapsedNanos() { return this.elapsedNanos; }
++    public long[] getWorkNanos() { return this.workNanos.clone(); }
++    public int getTotalTicks() { return this.totalTicks; }
++    public boolean isTruncated() { return this.totalTicks > this.workNanos.length; }
++    @Override public HandlerList getHandlers() { return HANDLERS; }
++    public static HandlerList getHandlerList() { return HANDLERS; }
++}

@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Thu, 29 Oct 2026 14:34:23 +0800
+Subject: [PATCH] Report slow tick activity intervals
+
+
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 21fd000b57755ae6bf5142b7a4cc96115efecddc..97c80b919503d9c038fb8c4d76a6166686beda96 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -131,6 +131,14 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+     private long delayedTasksMaxNextTickTime;
+     private boolean waitingForNextTick = false;
+     private long tickIdleNanos;
++    private long[] tickIdleRanges;
++    private int tickIdleRangeCount;
++    private boolean tickIdleRangesTruncated;
++    private boolean slowTickMonitoring;
++    private long[] tickSummaryDurations;
++    private long tickSummaryStart;
++    private int tickSummaryCount;
++    private boolean tickSummaryActive;
+     // PandaSpigot end
+ 
+     public MinecraftServer(OptionSet options, Proxy proxy, File file1) {
+@@ -743,7 +751,18 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+         boolean idle = this.waitingForNextTick && !this.runningTask();
+         long waitTime = this.waitingForNextTick ? this.ab - start : IAsyncTaskHandler.BLOCK_TIME_NANOS;
+         LockSupport.parkNanos("waiting for tasks", waitTime);
+-        if (idle) this.tickIdleNanos += getNanoTime() - start;
++        if (idle) {
++            long end = getNanoTime();
++            this.tickIdleNanos += end - start;
++            if (this.slowTickMonitoring) {
++                if (this.tickIdleRangeCount < this.tickIdleRanges.length) {
++                    this.tickIdleRanges[this.tickIdleRangeCount++] = start;
++                    this.tickIdleRanges[this.tickIdleRangeCount++] = end;
++                } else {
++                    this.tickIdleRangesTruncated = true;
++                }
++            }
++        }
+     }
+ 
+     public TickTask wrapRunnable(final Runnable runnable) {
+@@ -803,6 +822,20 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+         co.aikar.timings.TimingsManager.FULL_SERVER_TICK.startTiming(); // Spigot
+         long i = getNanoTime();
+         this.tickIdleNanos = 0;
++        this.slowTickMonitoring = com.hpfxd.pandaspigot.event.server.SlowTickEvent.getHandlerList().getRegisteredListeners().length != 0;
++        if (this.slowTickMonitoring && this.tickIdleRanges == null) this.tickIdleRanges = new long[128];
++        this.tickIdleRangeCount = 0;
++        this.tickIdleRangesTruncated = false;
++        if (com.hpfxd.pandaspigot.event.server.TickSummaryEvent.getHandlerList().getRegisteredListeners().length != 0) {
++            if (this.tickSummaryDurations == null) this.tickSummaryDurations = new long[4096];
++            if (!this.tickSummaryActive) {
++                this.tickSummaryStart = i;
++                this.tickSummaryCount = 0;
++                this.tickSummaryActive = true;
++            }
++        } else {
++            this.tickSummaryActive = false;
++        }
+         new com.destroystokyo.paper.event.server.ServerTickStartEvent(this.ticks + 1).callEvent(); // PandaSpigot - Add ServerTickStartEvent
+ 
+         ++this.ticks;
+@@ -887,9 +920,27 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+         this.waitUntilNextTick();
+         org.spigotmc.WatchdogThread.tick(); // Spigot
+         // PandaSpigot start - Retain queued work in full-tick accounting without idle time.
+-        this.h[this.ticks % 100] = getNanoTime() - start - this.tickIdleNanos;
++        long tickEnd = getNanoTime();
++        long tickWork = tickEnd - start - this.tickIdleNanos;
++        this.h[this.ticks % 100] = tickWork;
+         // PandaSpigot end
+         co.aikar.timings.TimingsManager.FULL_SERVER_TICK.stopTiming(this.tickIdleNanos); // Spigot
++        if (this.slowTickMonitoring && tickWork > 20000000L) {
++            new com.hpfxd.pandaspigot.event.server.SlowTickEvent(this.ticks, start, tickEnd, workEnd,
++                    tickWork, java.util.Arrays.copyOf(this.tickIdleRanges, this.tickIdleRangeCount),
++                    this.tickIdleRangesTruncated).callEvent();
++        }
++        if (this.tickSummaryActive) {
++            if (this.tickSummaryCount < this.tickSummaryDurations.length) this.tickSummaryDurations[this.tickSummaryCount] = tickWork;
++            this.tickSummaryCount++;
++            long elapsed = tickEnd - this.tickSummaryStart;
++            if (elapsed >= 60000000000L) {
++                long[] durations = java.util.Arrays.copyOf(this.tickSummaryDurations,
++                        Math.min(this.tickSummaryCount, this.tickSummaryDurations.length));
++                new com.hpfxd.pandaspigot.event.server.TickSummaryEvent(elapsed, durations, this.tickSummaryCount).callEvent();
++                this.tickSummaryActive = false;
++            }
++        }
+     }
+ 
+     // PandaSpigot start - Tick-budgeted automatic saving
+diff --git a/src/test/java/net/minecraft/server/NetworkTickBoundaryTest.java b/src/test/java/net/minecraft/server/NetworkTickBoundaryTest.java
+index 4cc38dae55f1b3af8f193b0df0836f573e37992e..19cd36e4ca40273ea765db951204261ac729b0ef 100644
+--- a/src/test/java/net/minecraft/server/NetworkTickBoundaryTest.java
++++ b/src/test/java/net/minecraft/server/NetworkTickBoundaryTest.java
+@@ -1,6 +1,8 @@
+ package net.minecraft.server;
+ 
+ import com.destroystokyo.paper.event.server.ServerTickEndEvent;
++import com.hpfxd.pandaspigot.event.server.SlowTickEvent;
++import com.hpfxd.pandaspigot.event.server.TickSummaryEvent;
+ import java.lang.reflect.Field;
+ import java.lang.reflect.Proxy;
+ import java.util.ArrayList;
+@@ -79,7 +81,21 @@ public class NetworkTickBoundaryTest {
+         assertTickAccounting(60000000L, 0, 0);
+     }
+ 
++    @Test
++    public void ticksAtOrBelowThresholdAreNotReported() throws Exception {
++        assertTickAccounting(5000000L, 15000000L, 15000000L);
++    }
++
++    @Test
++    public void excessiveIdleRangesAreBoundedAndMarkedTruncated() throws Exception {
++        assertTickAccounting(30000000L, 1000000L, 0, 65);
++    }
++
+     private void assertTickAccounting(long mainWork, long idleWait, long queuedWork) throws Exception {
++        assertTickAccounting(mainWork, idleWait, queuedWork, 1);
++    }
++
++    private void assertTickAccounting(long mainWork, long idleWait, long queuedWork, int idleCount) throws Exception {
+         TestServer server = server();
+         SimplePluginManager manager = new SimplePluginManager(null, null);
+         Server previous = Bukkit.getServer();
+@@ -94,18 +110,27 @@ public class NetworkTickBoundaryTest {
+         watchdog.setAccessible(true);
+         Object previousWatchdog = watchdog.get(null);
+         watchdog.set(null, allocate(org.spigotmc.WatchdogThread.class));
+-        try (EventRecorder recorder = new EventRecorder(ServerTickEndEvent.getHandlerList())) {
++        try (EventRecorder recorder = new EventRecorder(ServerTickEndEvent.getHandlerList());
++             EventRecorder slowRecorder = new EventRecorder(SlowTickEvent.getHandlerList());
++             EventRecorder summaryRecorder = new EventRecorder(TickSummaryEvent.getHandlerList())) {
+             server.now = mainWork;
++            set(MinecraftServer.class, server, "slowTickMonitoring", true);
++            set(MinecraftServer.class, server, "tickIdleRanges", new long[128]);
++            set(MinecraftServer.class, server, "tickSummaryDurations", new long[4096]);
++            set(MinecraftServer.class, server, "tickSummaryStart", -60000000000L);
++            set(MinecraftServer.class, server, "tickSummaryActive", true);
+             server.waitAction = () -> {
+                 assertEquals("Tick end must be reported before idle parking", 1, recorder.events.size());
+                 ServerTickEndEvent event = (ServerTickEndEvent) recorder.events.get(0);
+                 assertEquals(mainWork / 1000000D, event.getTickDuration(), 0D);
+                 assertEquals("Spark must infer the actual work start", 0L,
+                         server.now - (long) (event.getTickDuration() * 1000000D));
+-                server.clockStep = idleWait;
+-                server.waitForTasks();
+-                server.clockStep = 0;
+-                server.now = mainWork + idleWait;
++                for (int i = 0; i < idleCount; i++) {
++                    server.clockStep = idleWait;
++                    server.waitForTasks();
++                    server.clockStep = 0;
++                    server.now = mainWork + idleWait * (i + 1);
++                }
+                 server.schedule(new TickTask(0, () -> {
+                     server.clockStep = queuedWork;
+                     server.waitForTasks();
+@@ -116,8 +141,27 @@ public class NetworkTickBoundaryTest {
+             set(MinecraftServer.class, server, "waitingForNextTick", true);
+             server.finishTick(0);
+             assertEquals(mainWork + queuedWork, server.h[0]);
+-            assertEquals(mainWork + idleWait + queuedWork, server.now);
++            assertEquals(mainWork + idleWait * idleCount + queuedWork, server.now);
+             assertEquals("Exactly one event is emitted per tick", 1, recorder.events.size());
++            assertEquals(1, summaryRecorder.events.size());
++            TickSummaryEvent summary = (TickSummaryEvent) summaryRecorder.events.get(0);
++            assertEquals(1, summary.getTotalTicks());
++            assertArrayEquals(new long[]{mainWork + queuedWork}, summary.getWorkNanos());
++            assertFalse(summary.isTruncated());
++            if (mainWork + queuedWork > 20000000L) {
++                assertEquals(1, slowRecorder.events.size());
++                SlowTickEvent slow = (SlowTickEvent) slowRecorder.events.get(0);
++                assertEquals(0L, slow.getStartNanos());
++                assertEquals(mainWork, slow.getWorkEndNanos());
++                assertEquals(mainWork + idleWait * idleCount + queuedWork, slow.getEndNanos());
++                assertEquals(mainWork + queuedWork, slow.getWorkNanos());
++                assertEquals(Math.min(idleCount, 64) * 2, slow.getIdleRanges().length);
++                assertEquals(mainWork, slow.getIdleRanges()[0]);
++                assertEquals(mainWork + idleWait, slow.getIdleRanges()[1]);
++                assertEquals(idleCount > 64, slow.isRangesTruncated());
++            } else {
++                assertTrue(slowRecorder.events.isEmpty());
++            }
+         } finally {
+             watchdog.set(null, previousWatchdog);
+             set(Bukkit.class, null, "server", previous);
