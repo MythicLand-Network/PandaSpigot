@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Mon, 9 Nov 2026 19:10:00 +0800
+Subject: [PATCH] Store small attribute UUID indexes inline in a flat array
+
+diff --git a/src/main/java/net/minecraft/server/AttributeModifiable.java b/src/main/java/net/minecraft/server/AttributeModifiable.java
+--- a/src/main/java/net/minecraft/server/AttributeModifiable.java
++++ b/src/main/java/net/minecraft/server/AttributeModifiable.java
+@@ -6,6 +6,7 @@
+ import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.Map;
++import java.util.Objects;
+ import java.util.Set;
+ import java.util.UUID;
+ 
+@@ -14,7 +15,9 @@
+     private final AttributeMapBase a;
+     private final IAttribute b;
+     private Set<AttributeModifier>[] modifiersByOperation;
+-    private Map<UUID, AttributeModifier> modifiersById;
++    // Null until the first modifier. Small indexes store values directly: the value already owns its UUID.
++    private Object modifiersById;
++    private static final int SMALL_INDEX_SIZE = 4;
+     private double f;
+     private boolean g = true;
+     private double h;
+@@ -70,7 +73,13 @@
+ 
+     @Override
+     public AttributeModifier a(UUID uuid) {
+-        return modifiersById == null ? null : modifiersById.get(uuid);
++        if (modifiersById instanceof AttributeModifier[]) {
++            for (AttributeModifier modifier : (AttributeModifier[]) modifiersById) {
++                if (modifier != null && Objects.equals(modifier.a(), uuid)) return modifier;
++            }
++            return null;
++        }
++        return modifiersById == null ? null : largeIndex().get(uuid);
+     }
+ 
+     @Override
+@@ -84,9 +93,44 @@
+             throw new IllegalArgumentException("Modifier is already applied on this attribute!");
+         } else {
+             this.a(attributemodifier.c()).add(attributemodifier);
+-            if (modifiersById == null) modifiersById = Maps.newHashMap();
+-            modifiersById.put(attributemodifier.a(), attributemodifier);
++            index(attributemodifier);
+             this.f();
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private Map<UUID, AttributeModifier> largeIndex() {
++        return (Map<UUID, AttributeModifier>) modifiersById;
++    }
++
++    private void index(AttributeModifier modifier) {
++        if (modifiersById == null) modifiersById = new AttributeModifier[SMALL_INDEX_SIZE];
++        if (modifiersById instanceof AttributeModifier[]) {
++            AttributeModifier[] small = (AttributeModifier[]) modifiersById;
++            for (int i = 0; i < small.length; ++i) {
++                if (small[i] == null) {
++                    small[i] = modifier;
++                    return;
++                }
++            }
++            Map<UUID, AttributeModifier> large = Maps.newHashMap();
++            for (AttributeModifier entry : small) large.put(entry.a(), entry);
++            modifiersById = large;
++        }
++        largeIndex().put(modifier.a(), modifier);
++    }
++
++    private void unindex(UUID id) {
++        if (modifiersById instanceof AttributeModifier[]) {
++            AttributeModifier[] small = (AttributeModifier[]) modifiersById;
++            for (int i = 0; i < small.length; ++i) {
++                if (small[i] != null && Objects.equals(small[i].a(), id)) {
++                    small[i] = null;
++                    return;
++                }
++            }
++        } else if (modifiersById != null) {
++            largeIndex().remove(id);
+         }
+     }
+ 
+@@ -101,7 +145,7 @@
+             modifiers(i).remove(attributemodifier);
+         }
+ 
+-        if (modifiersById != null) modifiersById.remove(attributemodifier.a());
++        unindex(attributemodifier.a());
+         this.f();
+     }
+ 
+diff --git a/src/test/java/net/minecraft/server/AttributeModifiableTest.java b/src/test/java/net/minecraft/server/AttributeModifiableTest.java
+--- a/src/test/java/net/minecraft/server/AttributeModifiableTest.java
++++ b/src/test/java/net/minecraft/server/AttributeModifiableTest.java
+@@ -35,4 +35,31 @@
+         base.c(relative);
+         assertEquals(20, value.getValue(), 0);
+     }
++
++    @Test
++    public void uuidIndexSurvivesHolesAndPromotionToHashMap() {
++        AttributeInstance value = new AttributeMapServer().b(GenericAttributes.MOVEMENT_SPEED);
++        AttributeModifier[] mods = new AttributeModifier[6];
++        for (int i = 0; i < mods.length; i++) {
++            // Include a null key and colliding UUID hashes, both supported by the original map.
++            mods[i] = new AttributeModifier(i == 0 ? null : new UUID(i, i), "fixture", 1, i % 3);
++        }
++        for (int i = 0; i < 4; i++) value.b(mods[i]);
++        value.c(new AttributeModifier(mods[1].a(), "alias", 9, 2));
++        assertNull(value.a(mods[1].a()));
++        assertSame(mods[3], value.a(mods[3].a()));
++        value.b(mods[4]);
++        value.b(mods[5]);
++        for (int i : new int[]{0, 2, 3, 4, 5}) assertSame(mods[i], value.a(mods[i].a()));
++        try {
++            value.b(new AttributeModifier(null, "duplicate", 2, 0));
++            fail("duplicate UUID accepted after promotion");
++        } catch (IllegalArgumentException expected) {
++            assertSame(mods[0], value.a((UUID) null));
++        }
++        value.c(mods[0]);
++        value.b(mods[1]);
++        assertNull(value.a((UUID) null));
++        assertSame(mods[1], value.a(mods[1].a()));
++    }
+ }

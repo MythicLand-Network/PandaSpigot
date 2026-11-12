@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Mon, 09 Nov 2026 11:21:24 +0800
+Subject: [PATCH] Defer initial permission calculation for opted-in actors
+
+
+diff --git a/src/main/java/org/bukkit/permissions/PermissibleBase.java b/src/main/java/org/bukkit/permissions/PermissibleBase.java
+index 3b95061aad53083219ca653c1ab5c629c2254e05..95440919abe6e099e6e27a916ed6e3ee7c61040f 100644
+--- a/src/main/java/org/bukkit/permissions/PermissibleBase.java
++++ b/src/main/java/org/bukkit/permissions/PermissibleBase.java
+@@ -18,16 +18,36 @@ public class PermissibleBase implements Permissible {
+     private Permissible parent = this;
+     private final List<PermissionAttachment> attachments = new LinkedList<PermissionAttachment>();
+     private final Map<String, PermissionAttachmentInfo> permissions = new HashMap<String, PermissionAttachmentInfo>();
++    private volatile boolean initialCalculationPending; // PandaSpigot
+ 
+     public PermissibleBase(ServerOperator opable) {
++        this(opable, false);
++    }
++
++    // PandaSpigot start - Defer default subscriptions for opted-in simulated players
++    public PermissibleBase(ServerOperator opable, boolean deferInitialCalculation) {
+         this.opable = opable;
+ 
+         if (opable instanceof Permissible) {
+             this.parent = (Permissible) opable;
+         }
+ 
+-        recalculatePermissions();
++        this.initialCalculationPending = deferInitialCalculation;
++        if (!deferInitialCalculation) {
++            recalculatePermissions();
++        }
++    }
++
++    private void ensurePermissionsInitialized() {
++        if (this.initialCalculationPending) {
++            synchronized (this) {
++                if (this.initialCalculationPending) {
++                    recalculatePermissions();
++                }
++            }
++        }
+     }
++    // PandaSpigot end
+ 
+     public boolean isOp() {
+         if (opable == null) {
+@@ -50,6 +70,7 @@ public class PermissibleBase implements Permissible {
+             throw new IllegalArgumentException("Permission name cannot be null");
+         }
+ 
++        ensurePermissionsInitialized(); // PandaSpigot
+         return permissions.containsKey(name.toLowerCase());
+     }
+ 
+@@ -160,6 +181,7 @@ public class PermissibleBase implements Permissible {
+         for (PermissionAttachment attachment : attachments) {
+             calculateChildPermissions(attachment.getPermissions(), false, attachment);
+         }
++        this.initialCalculationPending = false; // PandaSpigot
+     }
+ 
+     public synchronized void clearPermissions() {
+@@ -229,6 +251,7 @@ public class PermissibleBase implements Permissible {
+     }
+ 
+     public Set<PermissionAttachmentInfo> getEffectivePermissions() {
++        ensurePermissionsInitialized(); // PandaSpigot
+         return new HashSet<PermissionAttachmentInfo>(permissions.values());
+     }
+ 
+diff --git a/src/test/java/org/bukkit/permissions/PermissibleBaseTest.java b/src/test/java/org/bukkit/permissions/PermissibleBaseTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..56d64ba64a696e7f7280e6ad7b2e61d524168ee1
+--- /dev/null
++++ b/src/test/java/org/bukkit/permissions/PermissibleBaseTest.java
+@@ -0,0 +1,35 @@
++package org.bukkit.permissions;
++
++import java.util.Collections;
++import org.bukkit.TestServer;
++import org.bukkit.plugin.PluginManager;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class PermissibleBaseTest {
++    @Test
++    public void deferredPermissionsSubscribeOnFirstQueryAndFollowDefaultChanges() {
++        PluginManager manager = TestServer.getInstance().getPluginManager();
++        Permission child = new Permission("test.deferred.child", PermissionDefault.FALSE);
++        Permission parent = new Permission("test.deferred.parent", PermissionDefault.TRUE,
++                Collections.singletonMap(child.getName(), true));
++        manager.addPermission(child);
++        manager.addPermission(parent);
++        PermissibleBase deferred = new PermissibleBase(null, true);
++        PermissibleBase eager = new PermissibleBase(null);
++        try {
++            assertFalse(manager.getDefaultPermSubscriptions(false).contains(deferred));
++            assertTrue(manager.getDefaultPermSubscriptions(false).contains(eager));
++            assertTrue(deferred.hasPermission(child));
++            assertTrue(manager.getDefaultPermSubscriptions(false).contains(deferred));
++            parent.setDefault(PermissionDefault.FALSE);
++            assertFalse(deferred.hasPermission(child));
++        } finally {
++            deferred.clearPermissions();
++            eager.clearPermissions();
++            manager.removePermission(parent);
++            manager.removePermission(child);
++        }
++    }
++}

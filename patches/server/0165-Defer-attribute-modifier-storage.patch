@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Mon, 9 Nov 2026 18:30:00 +0800
+Subject: [PATCH] Defer attribute modifier storage until needed
+
+
+diff --git a/src/main/java/net/minecraft/server/AttributeModifiable.java b/src/main/java/net/minecraft/server/AttributeModifiable.java
+index 5def6e505a01eefdf7c348938dc4c84a05430be2..e32779f0b2b44b085838d390fac0ec4e94d3cfba 100644
+--- a/src/main/java/net/minecraft/server/AttributeModifiable.java
++++ b/src/main/java/net/minecraft/server/AttributeModifiable.java
+@@ -3,6 +3,7 @@ package net.minecraft.server;
+ import com.google.common.collect.Maps;
+ import com.google.common.collect.Sets;
+ import java.util.Collection;
++import java.util.Collections;
+ import java.util.HashSet;
+ import java.util.Map;
+ import java.util.Set;
+@@ -12,9 +13,8 @@ public class AttributeModifiable implements AttributeInstance {
+ 
+     private final AttributeMapBase a;
+     private final IAttribute b;
+-    private final Map<Integer, Set<AttributeModifier>> c = Maps.newHashMap();
+-    private final Map<String, Set<AttributeModifier>> d = Maps.newHashMap();
+-    private final Map<UUID, AttributeModifier> e = Maps.newHashMap();
++    private Set<AttributeModifier>[] modifiersByOperation;
++    private Map<UUID, AttributeModifier> modifiersById;
+     private double f;
+     private boolean g = true;
+     private double h;
+@@ -23,11 +23,6 @@ public class AttributeModifiable implements AttributeInstance {
+         this.a = attributemapbase;
+         this.b = iattribute;
+         this.f = iattribute.b();
+-
+-        for (int i = 0; i < 3; ++i) {
+-            this.c.put(i, Sets.newHashSet());
+-        }
+-
+     }
+ 
+     @Override
+@@ -49,8 +44,17 @@ public class AttributeModifiable implements AttributeInstance {
+     }
+ 
+     @Override
++    @SuppressWarnings("unchecked")
+     public Collection<AttributeModifier> a(int i) {
+-        return (Collection) this.c.get(i);
++        if (i < 0 || i >= 3) return null;
++        if (modifiersByOperation == null) modifiersByOperation = new Set[3];
++        if (modifiersByOperation[i] == null) modifiersByOperation[i] = Sets.newHashSet();
++        return modifiersByOperation[i];
++    }
++
++    private Set<AttributeModifier> modifiers(int operation) {
++        if (modifiersByOperation == null || modifiersByOperation[operation] == null) return Collections.emptySet();
++        return modifiersByOperation[operation];
+     }
+ 
+     @Override
+@@ -58,7 +62,7 @@ public class AttributeModifiable implements AttributeInstance {
+         HashSet hashset = Sets.newHashSet();
+ 
+         for (int i = 0; i < 3; ++i) {
+-            hashset.addAll(this.a(i));
++            hashset.addAll(modifiers(i));
+         }
+ 
+         return hashset;
+@@ -66,12 +70,12 @@ public class AttributeModifiable implements AttributeInstance {
+ 
+     @Override
+     public AttributeModifier a(UUID uuid) {
+-        return (AttributeModifier) this.e.get(uuid);
++        return modifiersById == null ? null : modifiersById.get(uuid);
+     }
+ 
+     @Override
+     public boolean a(AttributeModifier attributemodifier) {
+-        return this.e.get(attributemodifier.a()) != null;
++        return this.a(attributemodifier.a()) != null;
+     }
+ 
+     @Override
+@@ -79,11 +83,9 @@ public class AttributeModifiable implements AttributeInstance {
+         if (this.a(attributemodifier.a()) != null) {
+             throw new IllegalArgumentException("Modifier is already applied on this attribute!");
+         } else {
+-            Set<AttributeModifier> object = this.d.computeIfAbsent(attributemodifier.b(), k -> Sets.newHashSet());
+-
+-            this.c.get(attributemodifier.c()).add(attributemodifier);
+-            object.add(attributemodifier);
+-            this.e.put(attributemodifier.a(), attributemodifier);
++            this.a(attributemodifier.c()).add(attributemodifier);
++            if (modifiersById == null) modifiersById = Maps.newHashMap();
++            modifiersById.put(attributemodifier.a(), attributemodifier);
+             this.f();
+         }
+     }
+@@ -96,21 +98,10 @@ public class AttributeModifiable implements AttributeInstance {
+     @Override
+     public void c(AttributeModifier attributemodifier) {
+         for (int i = 0; i < 3; ++i) {
+-            Set set = (Set) this.c.get(i);
+-
+-            set.remove(attributemodifier);
+-        }
+-
+-        Set set1 = (Set) this.d.get(attributemodifier.b());
+-
+-        if (set1 != null) {
+-            set1.remove(attributemodifier);
+-            if (set1.isEmpty()) {
+-                this.d.remove(attributemodifier.b());
+-            }
++            modifiers(i).remove(attributemodifier);
+         }
+ 
+-        this.e.remove(attributemodifier.a());
++        if (modifiersById != null) modifiersById.remove(attributemodifier.a());
+         this.f();
+     }
+ 
+@@ -145,7 +136,9 @@ public class AttributeModifiable implements AttributeInstance {
+     }
+ 
+     private Collection<AttributeModifier> b(int i) {
+-        HashSet hashset = Sets.newHashSet(this.a(i));
++        Set<AttributeModifier> own = modifiers(i);
++        if (own.isEmpty() && this.b.d() == null) return Collections.emptySet();
++        HashSet hashset = Sets.newHashSet(own);
+ 
+         for (IAttribute iattribute = this.b.d(); iattribute != null; iattribute = iattribute.d()) {
+             AttributeInstance attributeinstance = this.a.a(iattribute);
+diff --git a/src/test/java/net/minecraft/server/AttributeModifiableTest.java b/src/test/java/net/minecraft/server/AttributeModifiableTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..34a45773d45e72b7f1e6f8c522d4031e56f76f88
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/AttributeModifiableTest.java
+@@ -0,0 +1,38 @@
++package net.minecraft.server;
++
++import java.util.Collection;
++import java.util.UUID;
++import org.junit.Test;
++import static org.junit.Assert.*;
++
++public class AttributeModifiableTest {
++    @Test
++    public void inheritedModifiersAndLiveOperationViewsSurviveLazyInitialization() {
++        AttributeMapServer attributes = new AttributeMapServer();
++        IAttribute parent = new AttributeRanged(null, "parent", 1, 0, 100);
++        IAttribute child = new AttributeRanged(parent, "child", 10, 0, 100);
++        AttributeInstance base = attributes.b(parent);
++        AttributeInstance value = attributes.b(child);
++        Collection<AttributeModifier> additions = value.a(0);
++        AttributeModifier add = new AttributeModifier(UUID.randomUUID(), "same", 2, 0);
++        AttributeModifier relative = new AttributeModifier(UUID.randomUUID(), "same", 0.5, 1);
++        AttributeModifier multiply = new AttributeModifier(UUID.randomUUID(), "same", 1, 2);
++
++        assertEquals(10, value.getValue(), 0);
++        value.b(add);
++        base.b(relative);
++        value.b(multiply);
++        assertTrue(additions.contains(add));
++        assertSame(add, value.a(add.a()));
++        assertEquals(36, value.getValue(), 0);
++        assertEquals(2, value.c().size());
++        value.c().clear();
++        assertEquals(2, value.c().size());
++        value.c(new AttributeModifier(add.a(), "different", 9, 2));
++        assertTrue(additions.isEmpty());
++        assertNull(value.a(add.a()));
++        assertEquals(30, value.getValue(), 0);
++        base.c(relative);
++        assertEquals(20, value.getValue(), 0);
++    }
++}

@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Mon, 9 Nov 2026 20:46:00 +0800
+Subject: [PATCH] Reduce cold login work
+
+--- a/src/main/java/net/minecraft/server/StatisticManager.java
++++ b/src/main/java/net/minecraft/server/StatisticManager.java
+@@ -2,6 +2,8 @@
+ 
+ import com.google.common.collect.Maps;
+ import java.util.Map;
++import org.bukkit.event.player.PlayerAchievementAwardedEvent;
++import org.bukkit.event.player.PlayerStatisticIncrementEvent;
+ 
+ public class StatisticManager {
+ 
+@@ -20,9 +22,14 @@
+     public void b(EntityHuman entityhuman, Statistic statistic, int i) {
+         if (!statistic.d() || this.b((Achievement) statistic)) {
+             // CraftBukkit start - fire Statistic events
+-            org.bukkit.event.Cancellable cancellable = org.bukkit.craftbukkit.event.CraftEventFactory.handleStatisticsIncrease(entityhuman, statistic, this.getStatisticValue(statistic), i);
+-            if (cancellable != null && cancellable.isCancelled()) {
+-                return;
++            boolean observed = statistic instanceof Achievement
++                    ? PlayerAchievementAwardedEvent.getHandlerList().getRegisteredListeners().length != 0
++                    : PlayerStatisticIncrementEvent.getHandlerList().getRegisteredListeners().length != 0;
++            if (observed) {
++                org.bukkit.event.Cancellable cancellable = org.bukkit.craftbukkit.event.CraftEventFactory.handleStatisticsIncrease(entityhuman, statistic, this.getStatisticValue(statistic), i);
++                if (cancellable != null && cancellable.isCancelled()) {
++                    return;
++                }
+             }
+             // CraftBukkit end
+             this.setStatistic(entityhuman, statistic, this.getStatisticValue(statistic) + i);
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -3,7 +3,6 @@
+ import com.hpfxd.pandaspigot.diagnostics.CombatTrace;
+ 
+ import com.google.common.base.Predicate;
+-import com.google.common.base.Predicates;
+ import com.google.common.collect.Maps;
+ import java.util.Collection;
+ import java.util.Iterator;
+@@ -34,6 +33,7 @@
+ 
+ public abstract class EntityLiving extends Entity {
+ 
++    private static final Predicate<Entity> COLLIDABLE = entity -> IEntitySelector.d.apply(entity) && entity.ae();
+     private static final UUID a = UUID.fromString("662A6B8D-DA3E-4C1C-8813-96EA6097278D");
+     private static final AttributeModifier b = (new AttributeModifier(EntityLiving.a, "Sprinting speed boost", 0.30000001192092896D, 2)).a(false);
+     private AttributeMapBase c;
+@@ -1709,15 +1709,7 @@
+     protected void doTick() {}
+ 
+     protected void bL() {
+-        List list = this.world.a((Entity) this, this.getBoundingBox().grow(0.20000000298023224D, 0.0D, 0.20000000298023224D), Predicates.and(IEntitySelector.d, new Predicate() {
+-            public boolean a(Entity entity) {
+-                return entity.ae();
+-            }
+-
+-            public boolean apply(Object object) {
+-                return this.a((Entity) object);
+-            }
+-        }));
++        List list = this.world.a((Entity) this, this.getBoundingBox().grow(0.20000000298023224D, 0.0D, 0.20000000298023224D), COLLIDABLE);
+ 
+         if (this.ad() && !list.isEmpty()) { // Spigot: Add this.ad() condition
+             numCollisions -= world.spigotConfig.maxCollisionsPerEntity; // Spigot
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -140,6 +140,14 @@
+     }
+     // PandaSpigot end
+ 
++    // PlayerChunkMap has already requested this chunk and owns its completion callback.
++    public void completePlayerChunk(int x, int z) {
++        unloadQueue.remove(x, z);
++        if (getChunkIfLoaded(x, z) != null) return;
++        ChunkRegionLoader loader = this.chunkLoader instanceof ChunkRegionLoader ? (ChunkRegionLoader) this.chunkLoader : null;
++        ChunkIOExecutor.syncChunkLoad(world, loader, this, x, z);
++    }
++
+     public Chunk getChunkAt(int i, int j, Runnable runnable) {
+         unloadQueue.remove(i, j);
+         Chunk chunk = chunks.get(LongHash.toLong(i, j));
+--- a/src/main/java/net/minecraft/server/PlayerList.java
++++ b/src/main/java/net/minecraft/server/PlayerList.java
+@@ -247,7 +247,7 @@
+         }
+ 
+         worldserver1.getPlayerChunkMap().addPlayer(entityplayer);
+-        worldserver1.chunkProviderServer.getChunkAt((int) entityplayer.locX >> 4, (int) entityplayer.locZ >> 4);
++        worldserver1.chunkProviderServer.completePlayerChunk((int) entityplayer.locX >> 4, (int) entityplayer.locZ >> 4);
+     }
+ 
+     public int d() {
+--- a/src/test/java/net/minecraft/server/ChunkNetworkTest.java
++++ b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+@@ -186,6 +186,32 @@
+         } finally {
+             configField.set(null, previous);
+         }
++    }
++
++    @Test
++    public void loginCompletesTheWatchedCenterWithoutProbingDiskAgain() throws Exception {
++        WorldServer world = allocate(WorldServer.class);
++        List<String> events = new ArrayList<>();
++        ChunkRegionLoader loader = new ChunkRegionLoader(this.temporary.newFolder()) {
++            @Override
++            public boolean chunkExists(World ignored, int x, int z) {
++                throw new AssertionError("A pending view load already owns the disk lookup");
++            }
++        };
++        ChunkProviderServer provider = new ChunkProviderServer(world, loader, null) {
++            @Override
++            public Chunk originalGetChunkAt(int x, int z) {
++                events.add("generate");
++                Chunk chunk = new EmptyChunk(world, x, z);
++                this.chunks.put(LongHash.toLong(x, z), chunk);
++                return chunk;
++            }
++        };
++        provider.loadPlayerChunk(-1, 0, () -> events.add("notify"));
++        provider.completePlayerChunk(-1, 0);
++        assertNotNull(provider.getChunkIfLoaded(-1, 0));
++        provider.completePlayerChunk(-1, 0);
++        assertEquals(Arrays.asList("generate", "notify"), events);
+     }
+ 
+     @Test

@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Mon, 09 Nov 2026 11:21:24 +0800
+Subject: [PATCH] Budget view chunk generation
+
+
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index 315dd5b63e9fce4a96fa3b638c0af481730841da..484d015b1dbf6bb0b5377b4a7039d0e42e1a1df7 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -127,6 +127,19 @@ public class ChunkProviderServer implements IChunkProvider {
+         return getChunkAt(i, j, null);
+     }
+ 
++    // PandaSpigot start - Defer missing view chunks to the budgeted main-thread completion
++    public void loadPlayerChunk(int x, int z, Runnable ready) {
++        unloadQueue.remove(x, z);
++        if (getChunkIfLoaded(x, z) != null) {
++            ready.run();
++            return;
++        }
++        ChunkRegionLoader loader = this.chunkLoader instanceof ChunkRegionLoader
++                ? (ChunkRegionLoader) this.chunkLoader : null;
++        ChunkIOExecutor.queueChunkLoad(world, loader, this, x, z, ready);
++    }
++    // PandaSpigot end
++
+     public Chunk getChunkAt(int i, int j, Runnable runnable) {
+         unloadQueue.remove(i, j);
+         Chunk chunk = chunks.get(LongHash.toLong(i, j));
+@@ -143,6 +156,7 @@ public class ChunkProviderServer implements IChunkProvider {
+                 return null;
+             } else {
+                 chunk = ChunkIOExecutor.syncChunkLoad(world, loader, this, i, j);
++                if (chunk == null) chunk = getChunkIfLoaded(i, j); // PandaSpigot - A queued load may have generated the chunk
+             }
+         } else if (chunk == null) {
+             chunk = originalGetChunkAt(i, j);
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+index 55e8fc56cabaa591c4810cbc93dae86d29d4e224..16ba129eb94413da8f264fbe6756cbb5673c22ad 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -17,7 +17,6 @@ import java.util.Collections;
+ import java.util.Queue;
+ import java.util.LinkedList;
+ import org.bukkit.craftbukkit.chunkio.ChunkIOExecutor;
+-import java.util.HashMap;
+ // CraftBukkit end
+ 
+ public class PlayerChunkMap {
+@@ -324,7 +323,8 @@ public class PlayerChunkMap {
+     public boolean a(EntityPlayer entityplayer, int i, int j) {
+         PlayerChunkMap.PlayerChunk playerchunkmap_playerchunk = this.a(i, j, false);
+ 
+-        return playerchunkmap_playerchunk != null && playerchunkmap_playerchunk.b.contains(entityplayer) && !entityplayer.chunkCoordIntPairQueue.contains(playerchunkmap_playerchunk.location);
++        return playerchunkmap_playerchunk != null && playerchunkmap_playerchunk.loaded // PandaSpigot - Do not track entities before their chunk
++                && playerchunkmap_playerchunk.b.contains(entityplayer) && !entityplayer.chunkCoordIntPairQueue.contains(playerchunkmap_playerchunk.location);
+     }
+ 
+     List<ChunkCoordIntPair> getPendingNearbyChunks(EntityPlayer player) {
+@@ -431,23 +431,24 @@ public class PlayerChunkMap {
+         private long g;
+         public Chunk chunk; // PandaSpigot - Alternative Chunk Ticking Selection
+ 
+-        // CraftBukkit start - add fields
+-        private final HashMap<EntityPlayer, Runnable> players = new HashMap<EntityPlayer, Runnable>();
++        // PandaSpigot start - One load per watched chunk, shared by all viewers
+         private boolean loaded = false;
+-        private Runnable loadedRunnable = new Runnable() {
+-            public void run() {
+-                PlayerChunk.this.loaded = true;
+-                PlayerChunk.this.chunk = PlayerChunkMap.this.a().chunkProviderServer.getChunkIfLoaded(PlayerChunk.this.location.x, PlayerChunk.this.location.z); // PandaSpigot - Alternative Chunk Ticking Selection
+-                PlayerChunk.this.loadedRunnable = null; // PandaSpigot - Release completed callback
+-            }
+-        };
+-        // CraftBukkit end
++        private Runnable loadedRunnable;
+ 
+         public PlayerChunk(int i, int j) {
+             this.location = new ChunkCoordIntPair(i, j);
+-            PlayerChunkMap.this.a().chunkProviderServer.getChunkAt(i, j, loadedRunnable); // CraftBukkit
+         }
+ 
++        private void finishLoad() {
++            this.chunk = PlayerChunkMap.this.world.chunkProviderServer.getChunkIfLoaded(this.location.x, this.location.z);
++            this.loaded = true;
++            this.loadedRunnable = null;
++            for (EntityPlayer player : this.b) {
++                player.chunkCoordIntPairQueue.add(this.location);
++            }
++        }
++        // PandaSpigot end
++
+         public void a(final EntityPlayer entityplayer) {  // CraftBukkit - added final to argument
+             if (this.b.contains(entityplayer)) {
+                 PlayerChunkMap.a.debug("Failed to add player. {} already is in chunk {}, {}", new Object[] { entityplayer, Integer.valueOf(this.location.x), Integer.valueOf(this.location.z)});
+@@ -457,20 +458,14 @@ public class PlayerChunkMap {
+                 }
+ 
+                 this.b.add(entityplayer);
+-                // CraftBukkit start - use async chunk io
++                // PandaSpigot start - Queue view chunks only while they have viewers
+                 if (this.loaded) {
+                     entityplayer.chunkCoordIntPairQueue.add(this.location);
+-                } else {
+-                    Runnable playerRunnable = new Runnable() { // PandaSpigot - Retain only pending callbacks
+-                        public void run() {
+-                            PlayerChunk.this.players.remove(entityplayer); // PandaSpigot
+-                            entityplayer.chunkCoordIntPairQueue.add(PlayerChunk.this.location);
+-                        }
+-                    };
+-                    this.players.put(entityplayer, playerRunnable); // PandaSpigot - Register before a possibly synchronous callback
+-                    PlayerChunkMap.this.a().chunkProviderServer.getChunkAt(this.location.x, this.location.z, playerRunnable);
++                } else if (this.loadedRunnable == null) {
++                    this.loadedRunnable = this::finishLoad;
++                    PlayerChunkMap.this.world.chunkProviderServer.loadPlayerChunk(this.location.x, this.location.z, this.loadedRunnable);
+                 }
+-                // CraftBukkit end
++                // PandaSpigot end
+             }
+         }
+ 
+@@ -478,15 +473,20 @@ public class PlayerChunkMap {
+             if (this.b.contains(entityplayer)) {
+                 // CraftBukkit start - If we haven't loaded yet don't load the chunk just so we can clean it up
+                 if (!this.loaded) {
+-                    ChunkIOExecutor.dropQueuedChunkLoad(PlayerChunkMap.this.a(), this.location.x, this.location.z, this.players.get(entityplayer));
+                     this.b.remove(entityplayer);
+-                    this.players.remove(entityplayer);
+ 
+                     if (this.b.isEmpty()) {
+                         ChunkIOExecutor.dropQueuedChunkLoad(PlayerChunkMap.this.a(), this.location.x, this.location.z, this.loadedRunnable);
++                        this.loadedRunnable = null; // PandaSpigot
+                         long i = (long) this.location.x + 2147483647L | (long) this.location.z + 2147483647L << 32;
+                         PlayerChunkMap.this.d.remove(i);
+                         PlayerChunkMap.this.f.remove(this);
++                        // PandaSpigot start - A synchronous caller may already have loaded the pending chunk
++                        ChunkProviderServer provider = PlayerChunkMap.this.world.chunkProviderServer;
++                        if (provider.isChunkLoaded(this.location.x, this.location.z)) {
++                            provider.queueUnload(this.location.x, this.location.z);
++                        }
++                        // PandaSpigot end
+                     }
+ 
+                     return;
+@@ -498,7 +498,6 @@ public class PlayerChunkMap {
+                     entityplayer.playerConnection.sendPacket(new PacketPlayOutMapChunk(chunk, true, 0));
+                 }
+ 
+-                this.players.remove(entityplayer); // CraftBukkit
+                 this.b.remove(entityplayer);
+                 entityplayer.chunkCoordIntPairQueue.remove(this.location);
+                 org.bukkit.Chunk bukkitChunk = chunk.bukkitChunk;
+@@ -522,7 +521,9 @@ public class PlayerChunkMap {
+         }
+ 
+         public void a() {
+-            this.a(PlayerChunkMap.this.world.getChunkAt(this.location.x, this.location.z));
++            if (this.loaded) { // PandaSpigot - Periodic accounting must not force a pending view load
++                this.a(PlayerChunkMap.this.world.getChunkAt(this.location.x, this.location.z));
++            }
+         }
+ 
+         private void a(Chunk chunk) {
+@@ -531,6 +532,7 @@ public class PlayerChunkMap {
+         }
+ 
+         public void a(int i, int j, int k) {
++            if (!this.loaded) return; // PandaSpigot - The full chunk packet will include these changes
+             if (this.dirtyCount == 0) {
+                 PlayerChunkMap.this.e.add(this);
+             }
+diff --git a/src/main/java/net/minecraft/server/RegionFileCache.java b/src/main/java/net/minecraft/server/RegionFileCache.java
+index 4cfaf3005f94881d01e11f9bf9a771da141e190c..c49542f4ccf87dac9f4d3d870cdc7516ab97783d 100644
+--- a/src/main/java/net/minecraft/server/RegionFileCache.java
++++ b/src/main/java/net/minecraft/server/RegionFileCache.java
+@@ -63,9 +63,9 @@ public class RegionFileCache {
+     }
+ 
+     public static DataInputStream c(File file, int i, int j) {
+-        RegionFile regionfile = a(file, i, j);
++        RegionFile regionfile = a(file, i, j, false); // PandaSpigot - A queued view chunk may not exist on disk
+ 
+-        return regionfile.a(i & 31, j & 31);
++        return regionfile == null ? null : regionfile.a(i & 31, j & 31);
+     }
+ 
+     public static DataOutputStream d(File file, int i, int j) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOProvider.java b/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOProvider.java
+index 1178ad7f7b7eda10917a3f92b400c788543d0312..48e83dc89bbb7d41fb380a3d8eb2194b56d48681 100644
+--- a/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOProvider.java
++++ b/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOProvider.java
+@@ -22,6 +22,7 @@ class ChunkIOProvider implements AsynchronousExecutor.CallBackProvider<QueuedChu
+     public Chunk callStage1(QueuedChunk queuedChunk) throws RuntimeException {
+         try {
+             ChunkRegionLoader loader = queuedChunk.loader;
++            if (loader == null) return null; // PandaSpigot - Custom loaders finish on the main thread
+             Object[] data = loader.loadChunk(queuedChunk.world, queuedChunk.x, queuedChunk.z);
+             
+             if (data != null) {
+@@ -37,6 +38,8 @@ class ChunkIOProvider implements AsynchronousExecutor.CallBackProvider<QueuedChu
+ 
+     // sync stuff
+     public void callStage2(QueuedChunk queuedChunk, Chunk chunk) throws RuntimeException {
++        // PandaSpigot - A synchronous request can load this chunk while a view load is queued.
++        if (queuedChunk.provider.getChunkIfLoaded(queuedChunk.x, queuedChunk.z) != null) return;
+         if (chunk == null) {
+             // If the chunk loading failed just do it synchronously (may generate)
+             queuedChunk.provider.originalGetChunkAt(queuedChunk.x, queuedChunk.z);
+diff --git a/src/test/java/net/minecraft/server/ChunkNetworkTest.java b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+index 6c4c1d49ff0d6ded68148f062f72c329dc969dbe..46b62b4175427583f46b2e36e46c17ee3c02d15b 100644
+--- a/src/test/java/net/minecraft/server/ChunkNetworkTest.java
++++ b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+@@ -19,11 +19,18 @@ import java.util.Queue;
+ import java.util.UUID;
+ 
+ import org.bukkit.support.AbstractTestingBase;
++import org.bukkit.craftbukkit.chunkio.ChunkIOExecutor;
++import org.bukkit.craftbukkit.util.LongHash;
++import org.junit.Rule;
+ import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
+ 
+ import static org.junit.Assert.*;
+ 
+ public class ChunkNetworkTest extends AbstractTestingBase {
++    @Rule
++    public TemporaryFolder temporary = new TemporaryFolder();
++
+     @Test
+     public void queueReorderingPreservesSpiralMembershipAcrossViewDistances() throws Exception {
+         for (int distance : new int[]{3, 10, 32}) {
+@@ -67,22 +74,18 @@ public class ChunkNetworkTest extends AbstractTestingBase {
+     }
+ 
+     @Test
+-    public void loadedChunksReleasePlayerCallbacksForImmediateAndDelayedLoads() throws Exception {
+-        for (int mode = 0; mode < 3; mode++) {
++    public void watchedChunksShareOneLoadAndNotifyOnlyCurrentViewers() throws Exception {
++        for (boolean immediate : new boolean[]{true, false}) {
+             PlayerChunkMap map = allocate(PlayerChunkMap.class);
+             WorldServer world = allocate(WorldServer.class);
+             world.worldData = allocate(WorldData.class);
+             CallbackChunkProvider provider = allocate(CallbackChunkProvider.class);
+             provider.callbacks = new ArrayList<>();
+-            provider.immediate = mode == 0;
++            provider.immediate = immediate;
+             world.chunkProviderServer = provider;
+             set(map, "world", world);
+             PlayerChunkMap.PlayerChunk chunk = map.new PlayerChunk(0, 0);
+-            Field callbacks = chunk.getClass().getDeclaredField("players");
+-            callbacks.setAccessible(true);
+-            Map<?, ?> pending = (Map<?, ?>) callbacks.get(chunk);
+-            // A pending disk load may complete synchronously during the next registration.
+-            if (mode == 2) provider.immediate = true;
++            assertTrue(provider.callbacks.isEmpty());
+             List<EntityPlayer> players = new ArrayList<>();
+             Field entityId = Entity.class.getDeclaredField("id");
+             entityId.setAccessible(true);
+@@ -93,12 +96,15 @@ public class ChunkNetworkTest extends AbstractTestingBase {
+                 players.add(player);
+                 chunk.a(player);
+             }
+-            if (mode == 1) {
+-                assertEquals(players.size(), pending.size());
++            if (!immediate) {
++                assertEquals(1, provider.callbacks.size());
+                 for (EntityPlayer player : players) assertTrue(player.chunkCoordIntPairQueue.isEmpty());
++                EntityPlayer departed = players.remove(0);
++                chunk.b(departed);
+                 provider.complete();
++                assertTrue(departed.chunkCoordIntPairQueue.isEmpty());
+             }
+-            assertTrue("Only callbacks for unfinished loads should be retained", pending.isEmpty());
++            assertEquals(1, provider.loads);
+             for (EntityPlayer player : players) {
+                 assertEquals(Arrays.asList(new ChunkCoordIntPair(0, 0)), player.chunkCoordIntPairQueue);
+             }
+@@ -111,16 +117,17 @@ public class ChunkNetworkTest extends AbstractTestingBase {
+     private static final class CallbackChunkProvider extends ChunkProviderServer {
+         private List<Runnable> callbacks;
+         private boolean immediate;
++        private int loads;
+ 
+         private CallbackChunkProvider() {
+             super(null, null, null);
+         }
+ 
+         @Override
+-        public Chunk getChunkAt(int x, int z, Runnable callback) {
++        public void loadPlayerChunk(int x, int z, Runnable callback) {
++            this.loads++;
+             this.callbacks.add(callback);
+             if (this.immediate) this.complete();
+-            return null;
+         }
+ 
+         @Override
+@@ -134,6 +141,53 @@ public class ChunkNetworkTest extends AbstractTestingBase {
+         }
+     }
+ 
++    @Test
++    public void missingViewChunksGenerateWithinTheCompletionBudget() throws Exception {
++        Field configField = PandaSpigotConfig.class.getDeclaredField("config");
++        configField.setAccessible(true);
++        Object previous = configField.get(null);
++        PandaSpigotConfig config = new PandaSpigotConfig();
++        config.chunkIoMaxChunksPerTick = 1;
++        configField.set(null, config);
++        try {
++            WorldServer world = allocate(WorldServer.class);
++            java.io.File folder = this.temporary.newFolder();
++            List<Integer> generated = new ArrayList<>();
++            Thread mainThread = Thread.currentThread();
++            ChunkProviderServer provider = new ChunkProviderServer(world, new ChunkRegionLoader(folder), null) {
++                @Override
++                public Chunk originalGetChunkAt(int x, int z) {
++                    assertSame(mainThread, Thread.currentThread());
++                    generated.add(x);
++                    Chunk chunk = new EmptyChunk(world, x, z);
++                    this.chunks.put(LongHash.toLong(x, z), chunk);
++                    return chunk;
++                }
++            };
++            List<Integer> ready = new ArrayList<>();
++            provider.loadPlayerChunk(0, 0, () -> ready.add(0));
++            Runnable canceled = () -> fail("Removed viewer still received a chunk");
++            provider.loadPlayerChunk(1, 0, canceled);
++            ChunkIOExecutor.dropQueuedChunkLoad(world, 1, 0, canceled);
++            provider.loadPlayerChunk(2, 0, () -> ready.add(2));
++            assertTrue(generated.isEmpty());
++
++            long deadline = System.nanoTime() + 5_000_000_000L;
++            while (ready.size() < 2 && System.nanoTime() < deadline) {
++                int before = generated.size();
++                ChunkIOExecutor.tick();
++                assertTrue(generated.size() <= before + 1);
++                if (generated.size() == before) Thread.sleep(1);
++            }
++            assertEquals(2, generated.size());
++            assertTrue(generated.containsAll(Arrays.asList(0, 2)));
++            assertEquals(generated, ready);
++            assertFalse(new java.io.File(folder, "region").exists());
++        } finally {
++            configField.set(null, previous);
++        }
++    }
++
+     @Test
+     public void tickSelectionPreservesStrictRangeAndPredicateOrder() throws Exception {
+         PlayerChunkMap.PlayerChunk chunk = allocate(PlayerChunkMap.PlayerChunk.class);

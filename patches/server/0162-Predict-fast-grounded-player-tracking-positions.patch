@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MythicLand <mythicland@users.noreply.github.com>
+Date: Sun, 08 Nov 2026 20:52:44 +0800
+Subject: [PATCH] Predict fast grounded player tracking positions
+
+Reduce visible approach lag with a bounded lead in regular position
+updates. Keep movement and combat authoritative on the server, and clear
+the lead across discontinuities and blocked paths.
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+index f8a434abfe92d31e390b70788805128fd1769a9f..3dde5577a1fb642b56484cd7c07f15a6e5d82a38 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+@@ -27,6 +27,10 @@ public class PandaSpigotWorldConfig {
+             "With this option enabled, they will be able to move their head just like normal.")
+     public boolean smoothTeleportation = false;
+ 
++    @Comment("Predicts the positions of fast grounded players by up to half a block in regular tracking packets.\n" +
++            "This reduces visible lag for observers without changing movement or attack processing.")
++    public boolean predictPlayerTrackingPositions = false;
++
+     @Comment("When enabled, this option disables reading and writing player data such as:\n" +
+             "- Position\n" +
+             "- Inventory\n" +
+diff --git a/src/main/java/net/minecraft/server/EntityTrackerEntry.java b/src/main/java/net/minecraft/server/EntityTrackerEntry.java
+index 05864b7e90f7587ab27b2267a03bdadb472cb56c..6a20dbf80ee293cd47871db3c7f04d80f2cc3bc0 100644
+--- a/src/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/src/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -39,6 +39,8 @@ public class EntityTrackerEntry {
+     private boolean x;
+     private boolean y;
+     public boolean n;
++    private PlayerPositionPrediction playerPrediction;
++    private boolean sentPredictedPosition;
+     // PaperSpigot start
+     // Replace trackedPlayers Set with a Map. The value is true until the player receives
+     // their first update (which is forced to have absolute coordinates), false afterward.
+@@ -69,6 +71,14 @@ public class EntityTrackerEntry {
+     }
+ 
+     public void track(List<EntityHuman> list) {
++        if (this.tracker instanceof EntityPlayer && this.tracker.world.pandaSpigotConfig.predictPlayerTrackingPositions) {
++            if (this.playerPrediction == null) {
++                this.playerPrediction = new PlayerPositionPrediction();
++            }
++            this.playerPrediction.sample((EntityPlayer) this.tracker);
++        } else {
++            this.playerPrediction = null;
++        }
+         this.n = false;
+         if (!this.isMoving || this.tracker.e(this.q, this.r, this.s) > 16.0D) {
+             this.q = this.tracker.locX;
+@@ -108,7 +118,8 @@ public class EntityTrackerEntry {
+             this.b();
+         }
+ 
+-        if (this.m % this.c == 0 || this.tracker.ai || this.tracker.getDataWatcher().a()) {
++        final boolean regularUpdate = this.m % this.c == 0;
++        if (regularUpdate || this.tracker.ai || this.tracker.getDataWatcher().a()) {
+             int i;
+             int j;
+ 
+@@ -117,13 +128,30 @@ public class EntityTrackerEntry {
+                 i = MathHelper.floor(this.tracker.locX * 32.0D);
+                 j = MathHelper.floor(this.tracker.locY * 32.0D);
+                 int k = MathHelper.floor(this.tracker.locZ * 32.0D);
++                boolean predicted = false;
++                final boolean relativeUpdate = this.v <= 400 && !this.x && this.y == this.tracker.onGround;
++                if (regularUpdate && relativeUpdate && this.m > 0 && this.playerPrediction != null
++                        && !this.trackedPlayers.isEmpty() && this.playerPrediction.hasLead()
++                        && fitsRelativeMove(i - this.xLoc, j - this.yLoc, k - this.zLoc)) {
++                    final int predictedX = MathHelper.floor((this.tracker.locX + this.playerPrediction.leadX) * 32.0D);
++                    final int predictedZ = MathHelper.floor((this.tracker.locZ + this.playerPrediction.leadZ) * 32.0D);
++                    if ((predictedX != i || predictedZ != k)
++                            && fitsRelativeMove(predictedX - this.xLoc, j - this.yLoc, predictedZ - this.zLoc)
++                            && this.canSendPredictedPosition(predictedX, predictedZ)) {
++                        i = predictedX;
++                        k = predictedZ;
++                        predicted = true;
++                    }
++                }
+                 int l = MathHelper.d(this.tracker.yaw * 256.0F / 360.0F);
+                 int i1 = MathHelper.d(this.tracker.pitch * 256.0F / 360.0F);
+                 int j1 = i - this.xLoc;
+                 int k1 = j - this.yLoc;
+                 int l1 = k - this.zLoc;
+                 Object object = null;
+-                boolean flag = Math.abs(j1) >= 4 || Math.abs(k1) >= 4 || Math.abs(l1) >= 4 || this.m % 60 == 0;
++                // Correct an earlier prediction even when the remaining delta is below the usual movement threshold.
++                final boolean correctPrediction = this.sentPredictedPosition && !predicted && (j1 != 0 || k1 != 0 || l1 != 0);
++                boolean flag = Math.abs(j1) >= 4 || Math.abs(k1) >= 4 || Math.abs(l1) >= 4 || this.m % 60 == 0 || correctPrediction;
+                 boolean flag1 = Math.abs(l - this.yRot) >= 4 || Math.abs(i1 - this.xRot) >= 4;
+ 
+                 if (this.m > 0 || this.tracker instanceof EntityArrow) { // PaperSpigot - Moved up
+@@ -132,6 +160,7 @@ public class EntityTrackerEntry {
+                         this.xLoc = i;
+                         this.yLoc = j;
+                         this.zLoc = k;
++                        this.sentPredictedPosition = predicted;
+                     }
+ 
+                     if (flag1) {
+@@ -140,7 +169,7 @@ public class EntityTrackerEntry {
+                     }
+                     // CraftBukkit end
+ 
+-                    if (j1 >= -128 && j1 < 128 && k1 >= -128 && k1 < 128 && l1 >= -128 && l1 < 128 && this.v <= 400 && !this.x && this.y == this.tracker.onGround) {
++                    if (relativeUpdate && fitsRelativeMove(j1, k1, l1)) {
+                         if ((!flag || !flag1) && !(this.tracker instanceof EntityArrow)) {
+                             if (flag) {
+                                 object = new PacketPlayOutEntity.PacketPlayOutRelEntityMove(this.tracker.getId(), (byte) j1, (byte) k1, (byte) l1, this.tracker.onGround);
+@@ -153,6 +182,7 @@ public class EntityTrackerEntry {
+                     } else {
+                         this.y = this.tracker.onGround;
+                         this.v = 0;
++                        this.sentPredictedPosition = false;
+                         // CraftBukkit start - Refresh list of who can see a player before sending teleport packet
+                         if (this.tracker instanceof EntityPlayer) {
+                             this.scanPlayers(new java.util.ArrayList(this.trackedPlayers));
+@@ -231,6 +261,7 @@ public class EntityTrackerEntry {
+                 this.zLoc = MathHelper.floor(this.tracker.locZ * 32.0D);
+                 this.b();
+                 this.x = true;
++                this.sentPredictedPosition = false;
+             }
+ 
+             i = MathHelper.d(this.tracker.getHeadRotation() * 256.0F / 360.0F);
+@@ -270,6 +301,93 @@ public class EntityTrackerEntry {
+ 
+     }
+ 
++    void resetPlayerPositionPrediction() {
++        if (this.playerPrediction != null) {
++            this.playerPrediction.reset();
++        }
++    }
++
++    private static boolean fitsRelativeMove(int x, int y, int z) {
++        return x >= -128 && x < 128 && y >= -128 && y < 128 && z >= -128 && z < 128;
++    }
++
++    private boolean canSendPredictedPosition(int x, int z) {
++        final World world = this.tracker.world;
++        final AxisAlignedBB current = this.tracker.getBoundingBox();
++        final double dx = x / 32.0D - this.tracker.locX;
++        final double dz = z / 32.0D - this.tracker.locZ;
++        final AxisAlignedBB swept = current.a(dx, 0.0D, dz);
++        final WorldBorder border = world.getWorldBorder();
++        if (swept.a < border.b() || swept.d > border.d() || swept.c < border.c() || swept.f > border.e()) {
++            return false;
++        }
++
++        // Use block-only collision queries over loaded chunks. The movement query can mutate entity state.
++        final BlockPosition min = new BlockPosition(swept.a, swept.b - 1.0D, swept.c);
++        final BlockPosition max = new BlockPosition(swept.d, swept.e, swept.f);
++        return world.areChunksLoadedBetween(min, max)
++                && world.a(swept).isEmpty()
++                && !world.a(current.c(dx, -0.0625D, dz)).isEmpty();
++    }
++
++    private static final class PlayerPositionPrediction {
++        private static final double MIN_SPEED_SQUARED = 0.27D * 0.27D;
++        private static final double MAX_SPEED_SQUARED = 0.90D * 0.90D;
++        private static final double MAX_LEAD = 0.50D;
++        private static final double MIN_DIRECTION_ALIGNMENT_SQUARED = 0.90D;
++
++        private double sampleX, sampleY, sampleZ;
++        private double previousDX, previousDZ;
++        private double leadX, leadZ;
++        private int stationaryTicks;
++        private boolean sampled;
++
++        void sample(EntityPlayer player) {
++            this.leadX = this.leadZ = 0.0D;
++            if (!player.onGround || player.dead || player.vehicle != null || player.abilities.isFlying || player.isSpectator()
++                    || player.isSleeping() || player.velocityChanged || player.ai) {
++                this.reset();
++                return;
++            }
++
++            final double dx = player.locX - this.sampleX;
++            final double dz = player.locZ - this.sampleZ;
++            final double speedSquared = dx * dx + dz * dz;
++            if (this.sampled && player.locY == this.sampleY
++                    && speedSquared >= MIN_SPEED_SQUARED && speedSquared <= MAX_SPEED_SQUARED) {
++                final double previousSpeedSquared = this.previousDX * this.previousDX + this.previousDZ * this.previousDZ;
++                final double alignment = dx * this.previousDX + dz * this.previousDZ;
++                if (previousSpeedSquared >= MIN_SPEED_SQUARED && alignment > 0.0D
++                        && alignment * alignment >= MIN_DIRECTION_ALIGNMENT_SQUARED * speedSquared * previousSpeedSquared) {
++                    final double scale = Math.min(1.0D, MAX_LEAD / Math.sqrt(speedSquared));
++                    this.leadX = dx * scale;
++                    this.leadZ = dz * scale;
++                }
++                this.previousDX = dx;
++                this.previousDZ = dz;
++                this.stationaryTicks = 0;
++            } else if (!this.sampled || speedSquared != 0.0D || player.locY != this.sampleY || ++this.stationaryTicks >= 2) {
++                this.previousDX = this.previousDZ = 0.0D;
++                this.stationaryTicks = 0;
++            }
++            this.sampleX = player.locX;
++            this.sampleY = player.locY;
++            this.sampleZ = player.locZ;
++            this.sampled = true;
++        }
++
++        boolean hasLead() {
++            return this.leadX != 0.0D || this.leadZ != 0.0D;
++        }
++
++        void reset() {
++            this.sampled = false;
++            this.previousDX = this.previousDZ = 0.0D;
++            this.leadX = this.leadZ = 0.0D;
++            this.stationaryTicks = 0;
++        }
++    }
++
+     private void b() {
+         DataWatcher datawatcher = this.tracker.getDataWatcher();
+ 
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index c3095f2a99952026d44f25f2070b8b2aa2dbd8e4..d6578a8f3bab0c2054fcfa669253bd42cb6fa8da 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -594,6 +594,12 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+         this.lastPitch = f3;
+         // CraftBukkit end
+ 
++        if (this.player.world.pandaSpigotConfig.predictPlayerTrackingPositions) {
++            EntityTrackerEntry entry = this.player.u().getTracker().trackedEntities.get(this.player.getId());
++            if (entry != null) {
++                entry.resetPlayerPositionPrediction();
++            }
++        }
+         this.player.setLocation(this.o, this.p, this.q, f2, f3);
+         this.player.playerConnection.sendPacket(new PacketPlayOutPosition(d0, d1, d2, f, f1, set));
+     }

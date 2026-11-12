@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Tue, 10 Nov 2026 16:40:00 +0800
+Subject: [PATCH] Skip idle network tick flushes
+
+--- a/src/main/java/net/minecraft/server/NetworkManager.java
++++ b/src/main/java/net/minecraft/server/NetworkManager.java
+@@ -91,6 +91,7 @@
+     private final java.util.concurrent.atomic.AtomicInteger packetWrites = new java.util.concurrent.atomic.AtomicInteger();
+     private int flushPacketsStart;
+     private final Object flushLock = new Object();
++    private final NetworkFlushHandler flushHandler = new NetworkFlushHandler(); // PandaSpigot - Skip idle tick flushes
+ 
+     public void disableAutomaticFlush() {
+         synchronized (this.flushLock) {
+@@ -152,6 +153,7 @@
+     public void channelActive(ChannelHandlerContext channelhandlercontext) throws Exception {
+         super.channelActive(channelhandlercontext);
+         this.channel = channelhandlercontext.channel();
++        this.channel.pipeline().addFirst("pending_flush", this.flushHandler); // PandaSpigot - Observe all outbound writes and actual flushes
+         this.l = this.channel.remoteAddress();
+         // Spigot Start
+         this.preparing = false;
+@@ -442,7 +444,7 @@
+             ((IUpdatePlayerListBox) this.m).c();
+         }
+ 
+-        if (enableExplicitFlush) this.channel.eventLoop().execute(() -> this.channel.flush()); // PandaSpigot - Allow Disabling Explicit Network Manager Flushing
++        if (enableExplicitFlush) this.flushHandler.flushIfNeeded(this.channel); // PandaSpigot - Skip idle tick flushes
+     }
+ 
+     public SocketAddress getSocketAddress() {
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/NetworkFlushHandler.java
+@@ -0,0 +1,34 @@
++package net.minecraft.server;
++
++import io.netty.channel.Channel;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelOutboundHandlerAdapter;
++import io.netty.channel.ChannelPromise;
++import io.netty.channel.EventLoop;
++import io.netty.util.concurrent.SingleThreadEventExecutor;
++
++final class NetworkFlushHandler extends ChannelOutboundHandlerAdapter {
++    private volatile boolean pendingWrites;
++
++    @Override
++    public void write(ChannelHandlerContext ctx, Object message, ChannelPromise promise) throws Exception {
++        this.pendingWrites = true;
++        ctx.write(message, promise);
++    }
++
++    @Override
++    public void flush(ChannelHandlerContext ctx) throws Exception {
++        this.pendingWrites = false;
++        ctx.flush();
++    }
++
++    void flushIfNeeded(Channel channel) {
++        // Use the real event loop, not a plugin's channel proxy. Queued writes may not have reached us yet.
++        EventLoop eventLoop = channel.pipeline().channel().eventLoop();
++        if (!this.pendingWrites && eventLoop instanceof SingleThreadEventExecutor
++                && ((SingleThreadEventExecutor) eventLoop).pendingTasks() == 0) return;
++        eventLoop.execute(() -> {
++            if (this.pendingWrites) channel.flush();
++        });
++    }
++}
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/NetworkFlushTest.java
+@@ -0,0 +1,127 @@
++package net.minecraft.server;
++
++import com.hpfxd.pandaspigot.config.PandaSpigotConfig;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.ChannelOutboundHandlerAdapter;
++import io.netty.channel.ChannelPromise;
++import io.netty.channel.DefaultEventLoop;
++import io.netty.channel.embedded.EmbeddedChannel;
++import io.netty.channel.local.LocalChannel;
++import java.lang.reflect.Field;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class NetworkFlushTest extends AbstractTestingBase {
++    @Test
++    public void idleTicksDoNotScheduleTasksButQueuedPluginWritesStillFlush() throws Exception {
++        DefaultEventLoop loop = new DefaultEventLoop();
++        LocalChannel channel = new LocalChannel();
++        CountingFlush counter = new CountingFlush() {
++            @Override
++            public void write(ChannelHandlerContext ctx, Object message, ChannelPromise promise) {
++                promise.setSuccess();
++            }
++        };
++        NetworkFlushHandler handler = new NetworkFlushHandler();
++        try {
++            loop.register(channel).sync();
++            channel.pipeline().addLast(counter, handler);
++            loop.submit(() -> {
++                handler.flushIfNeeded(channel);
++                assertEquals("Idle tick must not enqueue a flush task", 0, loop.pendingTasks());
++                loop.execute(() -> channel.write("queued-plugin-write"));
++                handler.flushIfNeeded(channel);
++            }).sync();
++            loop.submit(() -> assertEquals(1, counter.flushes)).sync();
++        } finally {
++            channel.close().sync();
++            loop.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS).sync();
++        }
++    }
++
++    @Test
++    public void idleAndAlreadyFlushedWritesDoNotFlushAgain() {
++        CountingFlush counter = new CountingFlush();
++        NetworkFlushHandler handler = new NetworkFlushHandler();
++        EmbeddedChannel channel = new EmbeddedChannel(counter, handler);
++        try {
++            for (int tick = 0; tick < 20; tick++) handler.flushIfNeeded(channel);
++            channel.runPendingTasks();
++            assertEquals(0, counter.flushes);
++            channel.writeAndFlush("immediate");
++            handler.flushIfNeeded(channel);
++            channel.runPendingTasks();
++            assertEquals(1, counter.flushes);
++            assertEquals("immediate", channel.readOutbound());
++            channel.write("direct-plugin-write");
++            handler.flushIfNeeded(channel);
++            channel.runPendingTasks();
++            assertEquals(2, counter.flushes);
++            assertEquals("direct-plugin-write", channel.readOutbound());
++        } finally {
++            channel.finishAndReleaseAll();
++        }
++    }
++
++    @Test
++    public void queuedWritesAreFlushedInOrderDuringTheSameEventLoopTurn() {
++        CountingFlush counter = new CountingFlush();
++        NetworkFlushHandler handler = new NetworkFlushHandler();
++        EmbeddedChannel channel = new EmbeddedChannel(counter, handler);
++        try {
++            channel.eventLoop().execute(() -> channel.write("spawn"));
++            channel.eventLoop().execute(() -> channel.write("equipment"));
++            handler.flushIfNeeded(channel);
++            channel.runPendingTasks();
++            assertEquals(1, counter.flushes);
++            assertEquals("spawn", channel.readOutbound());
++            assertEquals("equipment", channel.readOutbound());
++        } finally {
++            channel.finishAndReleaseAll();
++        }
++    }
++
++    @Test
++    public void trackerBatchAndUrgentPacketsKeepTheirFlushBoundaries() throws Exception {
++        Field config = PandaSpigotConfig.class.getDeclaredField("config");
++        config.setAccessible(true);
++        Object previous = config.get(null);
++        CountingFlush counter = new CountingFlush();
++        EmbeddedChannel channel = null;
++        try {
++            config.set(null, new PandaSpigotConfig());
++            NetworkManager network = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++            channel = new EmbeddedChannel(counter, network);
++            channel.attr(NetworkManager.c).set(EnumProtocol.PLAY);
++            PacketPlayOutEntityVelocity movement = new PacketPlayOutEntityVelocity(42, 0.1, 0.2, 0.3);
++            network.disableAutomaticFlush();
++            network.handle(movement);
++            assertEquals(0, counter.flushes);
++            network.enableAutomaticFlush();
++            assertEquals(1, counter.flushes);
++            assertSame(movement, channel.readOutbound());
++            network.disableAutomaticFlush();
++            network.handle(new PacketPlayOutKeepAlive(7));
++            assertEquals(2, counter.flushes);
++            assertTrue(channel.readOutbound() instanceof PacketPlayOutKeepAlive);
++            network.handle(new PacketPlayOutKickDisconnect(new ChatComponentText("done")));
++            assertEquals(3, counter.flushes);
++            assertTrue(channel.readOutbound() instanceof PacketPlayOutKickDisconnect);
++        } finally {
++            if (channel != null) channel.finishAndReleaseAll();
++            config.set(null, previous);
++        }
++    }
++
++    private static class CountingFlush extends ChannelOutboundHandlerAdapter {
++        int flushes;
++
++        @Override
++        public void flush(ChannelHandlerContext ctx) {
++            this.flushes++;
++            ctx.flush();
++        }
++    }
++}

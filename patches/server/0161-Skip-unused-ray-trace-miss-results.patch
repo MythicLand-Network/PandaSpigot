@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MythicLand <mythicland@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 19:27:00 +0800
+Subject: [PATCH] Skip unused ray trace miss results
+
+
+diff --git a/src/main/java/net/minecraft/server/World.java b/src/main/java/net/minecraft/server/World.java
+index 522c63e7f884a8b2202b111c81df9b54384703d5..8cb76c9a41cd75920e92fd23f995f3671a6e49cb 100644
+--- a/src/main/java/net/minecraft/server/World.java
++++ b/src/main/java/net/minecraft/server/World.java
+@@ -1019,7 +1019,7 @@ public abstract class World implements IBlockAccess {
+                             if (movingobjectposition2 != null) {
+                                 return movingobjectposition2;
+                             }
+-                        } else {
++                        } else if (flag2) {
+                             movingobjectposition1 = new MovingObjectPosition(MovingObjectPosition.EnumMovingObjectType.MISS, vec3d, enumdirection, blockposition);
+                         }
+                     }

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Mon, 09 Nov 2026 11:21:24 +0800
+Subject: [PATCH] Defer simulated player permission initialization
+
+
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 81aca094cf7376772a505df7699d5aa40694eb35..8d6aab9dec98015f2fca2a6c7027f6649a6681d5 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -1262,5 +1262,11 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+     public CraftPlayer getBukkitEntity() {
+         return (CraftPlayer) super.getBukkitEntity();
+     }
++
++    // PandaSpigot start - Allow simulated players to opt into lazy permission initialization
++    public boolean deferBukkitPermissionInitialization() {
++        return false;
++    }
++    // PandaSpigot end
+     // CraftBukkit end
+ }
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
+index 8a08babc132e992d3613e1281dac12875380990c..8433613b47674d43331e0857e3f907891a849325 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftHumanEntity.java
+@@ -31,12 +31,16 @@ import org.bukkit.plugin.Plugin;
+ public class CraftHumanEntity extends CraftLivingEntity implements HumanEntity {
+     private CraftInventoryPlayer inventory;
+     private final CraftInventory enderChest;
+-    protected final PermissibleBase perm = new PermissibleBase(this);
++    protected final PermissibleBase perm; // PandaSpigot
+     private boolean op;
+     private GameMode mode;
+ 
+     public CraftHumanEntity(final CraftServer server, final EntityHuman entity) {
+         super(server, entity);
++        // PandaSpigot start - Defer permission initialization for opted-in simulated players
++        this.perm = new PermissibleBase(this,
++                entity instanceof EntityPlayer && ((EntityPlayer) entity).deferBukkitPermissionInitialization());
++        // PandaSpigot end
+         mode = server.getDefaultGameMode();
+         this.inventory = new CraftInventoryPlayer(entity.inventory);
+         enderChest = new CraftInventory(entity.getEnderChest());
