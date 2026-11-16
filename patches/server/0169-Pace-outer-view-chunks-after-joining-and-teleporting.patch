@@ -1,0 +1,292 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Sat, 14 Nov 2026 14:00:00 +0800
+Subject: [PATCH] Pace outer view chunks after joining and teleporting
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+@@ -159,5 +159,7 @@
+     public int chunkUnloadMaxChunksPerTick = 100;
+     public double chunkUnloadMaxMillisPerTick = 2.0;
+     public int chunkSendMaxPendingBytes = 65536;
++    @Comment("Send outer view chunks after joining or teleporting in staggered batches. The nearby 3x3 keeps priority.")
++    public boolean paceOuterChunksAfterTeleport = false;
+     // PandaSpigot end
+ }
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -36,6 +36,8 @@
+     public double d;
+     public double e;
+     public final List<ChunkCoordIntPair> chunkCoordIntPairQueue = Lists.newLinkedList();
++    int outerChunkPacingUntilTick; // PandaSpigot
++    int outerChunkSendPhase = -1; // PandaSpigot
+     public final java.util.Deque<Integer> removeQueue = new java.util.ArrayDeque<>(); // PandaSpigot
+     private final ServerStatisticManager bK;
+     private float bL = Float.MIN_VALUE;
+@@ -262,11 +264,12 @@
+     }
+
+     // PandaSpigot start - Preserve chunk events, packets, tile entities and tracker order
+-    int sendQueuedChunks() {
+-        ArrayList arraylist = Lists.newArrayList();
++    int sendQueuedChunks(int maxOuterChunks) {
+         List<ChunkCoordIntPair> nearby = this.u().getPlayerChunkMap().getPendingNearbyChunks(this);
+         boolean prioritizeNearby = !nearby.isEmpty();
+-        int batchSize = prioritizeNearby ? nearby.size() : this.world.spigotConfig.maxBulkChunk;
++        int batchSize = prioritizeNearby ? nearby.size() : Math.min(this.world.spigotConfig.maxBulkChunk, maxOuterChunks);
++        if (batchSize <= 0) return 0;
++        ArrayList arraylist = Lists.newArrayList();
+         Iterator iterator1 = (prioritizeNearby ? nearby : this.chunkCoordIntPairQueue).iterator();
+         ArrayList arraylist1 = Lists.newArrayList();
+
+@@ -314,7 +317,7 @@
+                 this.u().getTracker().a(this, chunk);
+             }
+         }
+-        return arraylist.size();
++        return prioritizeNearby ? 0 : arraylist.size(); // PandaSpigot - Only outer chunks consume the shared budget
+     }
+     // PandaSpigot end
+
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -1666,6 +1666,10 @@
+         this.chunkSendQueue.add(player); // PandaSpigot
+     }
+
++    public void paceOuterPlayerChunks(EntityPlayer player) {
++        this.chunkSendQueue.startOuterPacing(player); // PandaSpigot
++    }
++
+     public boolean as() {
+         return false;
+     }
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -186,6 +186,7 @@
+
+         this.managedPlayers.add(entityplayer);
+         this.b(entityplayer);
++        this.world.getMinecraftServer().paceOuterPlayerChunks(entityplayer); // PandaSpigot
+     }
+
+     public void b(EntityPlayer entityplayer) {
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java b/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java
+--- a/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java
+@@ -4,26 +4,67 @@
+
+ import java.util.ArrayList;
+ import java.util.LinkedHashMap;
++import java.util.List;
+ import java.util.Map;
+ import java.util.UUID;
+
+ public final class PlayerChunkSendQueue {
++    private static final int OUTER_SEND_INTERVAL_TICKS = 3;
++    private static final int MAX_OUTER_CHUNKS_PER_BATCH = 4;
++    private static final int MAX_OUTER_CHUNKS_PER_TICK = 10;
++    private static final int OUTER_PACING_TICKS = 100;
++
+     private final Map<UUID, EntityPlayer> pending = new LinkedHashMap<>();
++    private int nextOuterSendPhase;
+
+     public void add(EntityPlayer player) {
+         this.pending.put(player.getUniqueID(), player);
+     }
+
++    public void startOuterPacing(EntityPlayer player) {
++        if (!PandaSpigotConfig.get().paceOuterChunksAfterTeleport) return;
++        int pacingUntilTick = MinecraftServer.currentTick + OUTER_PACING_TICKS;
++        if (player.outerChunkPacingUntilTick == pacingUntilTick) return;
++        player.outerChunkPacingUntilTick = pacingUntilTick;
++        player.outerChunkSendPhase = this.nextOuterSendPhase;
++        this.nextOuterSendPhase = (this.nextOuterSendPhase + 1) % OUTER_SEND_INTERVAL_TICKS;
++    }
++
+     public void tick(MinecraftServer server) {
+         PandaSpigotConfig config = PandaSpigotConfig.get();
++        int outerChunksRemaining = MAX_OUTER_CHUNKS_PER_TICK;
++        List<EntityPlayer> playersWithOuterSends = new ArrayList<>();
+         for (EntityPlayer player : new ArrayList<>(this.pending.values())) {
+             this.pending.remove(player.getUniqueID());
+             if (server.getPlayerList().a(player.getUniqueID()) != player || player.playerConnection == null
+                 || !player.playerConnection.networkManager.g() || player.chunkCoordIntPairQueue.isEmpty()) continue;
+             if (player.playerConnection.networkManager.canSendChunks(config.chunkSendMaxPendingBytes)) {
+-                player.sendQueuedChunks();
++                int maxOuterChunks = outerChunkLimit(config, player, MinecraftServer.currentTick);
++                if (maxOuterChunks == Integer.MAX_VALUE) {
++                    player.sendQueuedChunks(maxOuterChunks);
++                } else {
++                    int sentCount = player.sendQueuedChunks(Math.min(maxOuterChunks, outerChunksRemaining));
++                    if (sentCount > 0) {
++                        outerChunksRemaining -= sentCount;
++                        player.outerChunkPacingUntilTick = MinecraftServer.currentTick + OUTER_PACING_TICKS;
++                        playersWithOuterSends.add(player);
++                    }
++                }
+             }
+             if (!player.chunkCoordIntPairQueue.isEmpty()) this.pending.put(player.getUniqueID(), player);
+         }
++        for (EntityPlayer player : playersWithOuterSends) {
++            if (this.pending.remove(player.getUniqueID()) != null) this.add(player);
++        }
++    }
++
++    static int outerChunkLimit(PandaSpigotConfig config, EntityPlayer player, int tick) {
++        if (!config.paceOuterChunksAfterTeleport || player.outerChunkSendPhase < 0) return Integer.MAX_VALUE;
++        if (player.outerChunkPacingUntilTick - tick <= 0) {
++            player.outerChunkSendPhase = -1;
++            return Integer.MAX_VALUE;
++        }
++        return Math.floorMod(tick, OUTER_SEND_INTERVAL_TICKS) == player.outerChunkSendPhase
++                ? MAX_OUTER_CHUNKS_PER_BATCH : 0;
+     }
+ }
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -600,6 +600,12 @@
+                 entry.resetPlayerPositionPrediction();
+             }
+         }
++        // PandaSpigot start - Pace the outer view after teleporting across chunk boundaries
++        if ((MathHelper.floor(this.o) >> 4) != (MathHelper.floor(this.player.locX) >> 4)
++                || (MathHelper.floor(this.q) >> 4) != (MathHelper.floor(this.player.locZ) >> 4)) {
++            this.minecraftServer.paceOuterPlayerChunks(this.player);
++        }
++        // PandaSpigot end
+         this.player.setLocation(this.o, this.p, this.q, f2, f3);
+         this.player.playerConnection.sendPacket(new PacketPlayOutPosition(d0, d1, d2, f, f1, set));
+     }
+diff --git a/src/test/java/net/minecraft/server/ChunkNetworkTest.java b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+--- a/src/test/java/net/minecraft/server/ChunkNetworkTest.java
++++ b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+@@ -270,7 +270,7 @@
+         worldConfig.setAccessible(true);
+         worldConfig.set(world, config);
+         player.chunkCoordIntPairQueue.remove(adjacent);
+-        assertEquals(0, player.sendQueuedChunks());
++        assertEquals(0, player.sendQueuedChunks(0));
+         assertEquals(Arrays.asList(outer), player.chunkCoordIntPairQueue);
+
+         set(pending, "loaded", true);
+@@ -291,7 +291,9 @@
+         Object previous = config.get(null);
+         List<EmbeddedChannel> channels = new ArrayList<>();
+         try {
+-            config.set(null, new PandaSpigotConfig());
++            PandaSpigotConfig pacingConfig = new PandaSpigotConfig();
++            pacingConfig.paceOuterChunksAfterTeleport = true;
++            config.set(null, pacingConfig);
+             DedicatedServer server = allocate(DedicatedServer.class);
+             DedicatedPlayerList playerList = allocate(DedicatedPlayerList.class);
+             Map<UUID, EntityPlayer> online = new HashMap<>();
+@@ -315,6 +317,7 @@
+                 SendingPlayer player = allocate(SendingPlayer.class);
+                 player.id = UUID.randomUUID();
+                 player.world = world;
++                player.nearby = true;
+                 List<ChunkCoordIntPair> pending = new LinkedList<>();
+                 for (int x = -1; x <= 1; x++) {
+                     for (int z = -1; z <= 1; z++) pending.add(new ChunkCoordIntPair(x, z));
+@@ -330,6 +333,7 @@
+                 set(player.playerConnection, "networkManager", network);
+                 players.add(player);
+                 online.put(player.id, player);
++                queue.startOuterPacing(player);
+                 queue.add(player);
+             }
+             channels.get(0).unsafe().outboundBuffer().setUserDefinedWritability(1, false);
+@@ -347,9 +351,62 @@
+             online.put(stale.id, allocate(SendingPlayer.class));
+             queue.tick(server);
+             assertEquals(9, stale.sent);
++
++            int previousTick = MinecraftServer.currentTick;
++            try {
++                for (int index = 1; index <= 18; index++) {
++                    SendingPlayer player = players.get(index);
++                    player.nearby = false;
++                    for (int x = 2; x < 6; x++) {
++                        player.chunkCoordIntPairQueue.add(new ChunkCoordIntPair(x, 0));
++                    }
++                    queue.add(player);
++                }
++                for (int step = 1; step <= 9; step++) {
++                    MinecraftServer.currentTick++;
++                    int sentBeforeTick = players.stream().mapToInt(player -> player.sent).sum();
++                    queue.tick(server);
++                    int sentThisTick = players.stream().mapToInt(player -> player.sent).sum() - sentBeforeTick;
++                    assertTrue("Shared outer budget must hold with concurrent players", sentThisTick <= 10);
++                }
++                for (int index = 1; index <= 18; index++) {
++                    assertEquals("Every outer batch must make progress", 13, players.get(index).sent);
++                }
++            } finally {
++                MinecraftServer.currentTick = previousTick;
++            }
+         } finally {
+             for (EmbeddedChannel channel : channels) channel.finishAndReleaseAll();
+             config.set(null, previous);
++        }
++    }
++
++    @Test
++    public void teleportPacingStaggersOuterBatchesAndReturnsToNormalAfterExpiry() throws Exception {
++        Field configField = PandaSpigotConfig.class.getDeclaredField("config");
++        configField.setAccessible(true);
++        Object previousConfig = configField.get(null);
++        int previousTick = MinecraftServer.currentTick;
++        try {
++            MinecraftServer.currentTick = 100;
++            PlayerChunkSendQueue queue = new PlayerChunkSendQueue();
++            PandaSpigotConfig config = new PandaSpigotConfig();
++            config.paceOuterChunksAfterTeleport = true;
++            configField.set(null, config);
++            EntityPlayer first = allocate(EntityPlayer.class);
++            EntityPlayer second = allocate(EntityPlayer.class);
++            queue.startOuterPacing(first);
++            queue.startOuterPacing(first);
++            queue.startOuterPacing(second);
++            assertEquals(4, PlayerChunkSendQueue.outerChunkLimit(config, first, 102));
++            assertEquals(0, PlayerChunkSendQueue.outerChunkLimit(config, second, 102));
++            assertEquals(0, PlayerChunkSendQueue.outerChunkLimit(config, first, 103));
++            assertEquals(4, PlayerChunkSendQueue.outerChunkLimit(config, second, 103));
++            assertEquals(Integer.MAX_VALUE, PlayerChunkSendQueue.outerChunkLimit(config, first, 200));
++            assertEquals(Integer.MAX_VALUE, PlayerChunkSendQueue.outerChunkLimit(config, first, 201));
++        } finally {
++            configField.set(null, previousConfig);
++            MinecraftServer.currentTick = previousTick;
+         }
+     }
+
+@@ -434,6 +491,7 @@
+     private static final class SendingPlayer extends EntityPlayer {
+         private UUID id;
+         private int sent;
++        private boolean nearby;
+
+         private SendingPlayer() {
+             super(null, null, null, null);
+@@ -445,10 +503,11 @@
+         }
+
+         @Override
+-        int sendQueuedChunks() {
+-            int count = this.chunkCoordIntPairQueue.size();
++        int sendQueuedChunks(int maxOuterChunks) {
++            int count = this.nearby ? this.chunkCoordIntPairQueue.size()
++                    : Math.min(this.chunkCoordIntPairQueue.size(), maxOuterChunks);
+             this.sent += count;
+-            this.chunkCoordIntPairQueue.clear();
+-            return count;
++            this.chunkCoordIntPairQueue.subList(0, count).clear();
++            return this.nearby ? 0 : count;
+         }
+     }
