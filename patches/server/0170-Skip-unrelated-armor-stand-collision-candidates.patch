@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Fri, 20 Nov 2026 20:49:00 +0800
+Subject: [PATCH] Skip unrelated armor stand collision candidates
+
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+index bdbda3e61..72b6dc8bd 100644
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -41,6 +41,7 @@ public class Chunk {
+     // Keep this synced with entitySlices.add() and entitySlices.remove()
+     private final int[] itemCounts = new int[16];
+     private final int[] inventoryEntityCounts = new int[16];
++    private int minecartOrMultipartCount;
+     // PaperSpigot end
+     private boolean done;
+     private boolean lit;
+@@ -752,6 +753,9 @@ public class Chunk {
+         entity.af = k;
+         entity.ag = this.locZ;
+         this.entitySlices[k].add(entity);
++        if (entity instanceof EntityMinecartAbstract || entity.aB() != null) {
++            ++this.minecartOrMultipartCount;
++        }
+         // PaperSpigot start - update counts
+         if (entity instanceof EntityItem) {
+             itemCounts[k]++;
+@@ -791,6 +795,9 @@ public class Chunk {
+         }
+ 
+         if (!this.entitySlices[i].remove(entity)) return; // PandaSpigot
++        if (entity instanceof EntityMinecartAbstract || entity.aB() != null) {
++            --this.minecartOrMultipartCount;
++        }
+         // PaperSpigot start - update counts
+         if (entity instanceof EntityItem) {
+             itemCounts[i]--;
+@@ -982,6 +989,7 @@ public class Chunk {
+     }
+ 
+     public void a(Entity entity, AxisAlignedBB axisalignedbb, List<Entity> list, Predicate<? super Entity> predicate) {
++        if (this.minecartOrMultipartCount == 0 && predicate == EntityArmorStand.MINECARTS) return;
+         int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
+         int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityArmorStand.java b/src/main/java/net/minecraft/server/EntityArmorStand.java
+index f8415dd40..9773d46dc 100644
+--- a/src/main/java/net/minecraft/server/EntityArmorStand.java
++++ b/src/main/java/net/minecraft/server/EntityArmorStand.java
+@@ -1,5 +1,6 @@
+ package net.minecraft.server;
+ 
++import com.google.common.base.Predicate;
+ import java.util.List;
+ 
+ // CraftBukkit start
+@@ -244,19 +245,18 @@ public class EntityArmorStand extends EntityLiving {
+ 
+     protected void s(Entity entity) {}
+ 
+-    protected void bL() {
+-        List list = this.world.getEntities(this, this.getBoundingBox());
++    static final Predicate<Entity> MINECARTS = entity -> entity instanceof EntityMinecartAbstract;
+ 
+-        if (list != null && !list.isEmpty()) {
+-            for (int i = 0; i < list.size(); ++i) {
+-                Entity entity = (Entity) list.get(i);
++    protected void bL() {
++        List<Entity> minecarts = this.world.a(this, this.getBoundingBox(), MINECARTS);
++        if (minecarts == null) return;
+ 
+-                if (entity instanceof EntityMinecartAbstract && ((EntityMinecartAbstract) entity).s() == EntityMinecartAbstract.EnumMinecartType.RIDEABLE && this.h(entity) <= 0.2D) {
+-                    entity.collide(this);
+-                }
++        for (int i = 0; i < minecarts.size(); ++i) {
++            EntityMinecartAbstract minecart = (EntityMinecartAbstract) minecarts.get(i);
++            if (minecart.s() == EntityMinecartAbstract.EnumMinecartType.RIDEABLE && this.h(minecart) <= 0.2D) {
++                minecart.collide(this);
+             }
+         }
+-
+     }
+ 
+     public boolean a(EntityHuman entityhuman, Vec3D vec3d) {
