@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Fri, 20 Nov 2026 20:59:00 +0800
+Subject: [PATCH] Use direct block state lookups for chunk sections
+
+diff --git a/src/main/java/net/minecraft/server/Block.java b/src/main/java/net/minecraft/server/Block.java
+index a784e04a0..ec810f25c 100644
+--- a/src/main/java/net/minecraft/server/Block.java
++++ b/src/main/java/net/minecraft/server/Block.java
+@@ -8,7 +8,22 @@ public class Block {
+ 
+     private static final MinecraftKey a = new MinecraftKey("air");
+     public static final RegistryBlocks<MinecraftKey, Block> REGISTRY = new RegistryBlocks(Block.a);
+-    public static final RegistryID<IBlockData> d = new RegistryID();
++    // Chunk sections store unsigned 16-bit state IDs. Keep their lookup in sync
++    // with the registry, including replacements made after vanilla bootstrap.
++    private static final IBlockData[] chunkStates = new IBlockData[1 << 16];
++    public static final RegistryID<IBlockData> d = new RegistryID<IBlockData>() {
++        @Override
++        public void a(IBlockData state, int id) {
++            super.a(state, id);
++            if (id < chunkStates.length) chunkStates[id] = state;
++        }
++    };
++
++    static IBlockData getChunkState(char id) {
++        IBlockData state = chunkStates[id];
++        if (state == null) return Blocks.AIR.getBlockData();
++        return state;
++    }
+     private CreativeModeTab creativeTab;
+     public static final Block.StepSound e = new Block.StepSound("stone", 1.0F, 1.0F);
+     public static final Block.StepSound f = new Block.StepSound("wood", 1.0F, 1.0F);
+diff --git a/src/main/java/net/minecraft/server/ChunkSection.java b/src/main/java/net/minecraft/server/ChunkSection.java
+index 907c57b8c..c9380dd20 100644
+--- a/src/main/java/net/minecraft/server/ChunkSection.java
++++ b/src/main/java/net/minecraft/server/ChunkSection.java
+@@ -33,9 +33,7 @@ public class ChunkSection {
+     // CraftBukkit end
+ 
+     public IBlockData getType(int i, int j, int k) {
+-        IBlockData iblockdata = (IBlockData) Block.d.a(this.blockIds[j << 8 | k << 4 | i]);
+-
+-        return iblockdata != null ? iblockdata : Blocks.AIR.getBlockData();
++        return Block.getChunkState(this.blockIds[j << 8 | k << 4 | i]);
+     }
+ 
+     public void setType(int i, int j, int k, IBlockData iblockdata) {
+@@ -105,19 +103,11 @@ public class ChunkSection {
+         this.nonEmptyBlockCount = 0;
+         this.tickingBlockCount = 0;
+ 
+-        for (int i = 0; i < 16; ++i) {
+-            for (int j = 0; j < 16; ++j) {
+-                for (int k = 0; k < 16; ++k) {
+-                    Block block = this.b(i, j, k);
+-
+-                    if (block != Blocks.AIR) {
+-                        ++this.nonEmptyBlockCount;
+-                        if (block.isTicking()) {
+-                            ++this.tickingBlockCount;
+-                        }
+-                    }
+-                }
+-            }
++        for (int index = 0; index < 4096; ++index) {
++            Block block = Block.getChunkState(this.blockIds[index]).getBlock();
++            if (block == Blocks.AIR) continue;
++            ++this.nonEmptyBlockCount;
++            if (block.isTicking()) ++this.tickingBlockCount;
+         }
+ 
+     }
