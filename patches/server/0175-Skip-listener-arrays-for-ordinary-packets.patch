@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Sat, 21 Nov 2026 20:00:00 +0800
+Subject: [PATCH] Skip listener arrays for ordinary packets
+
+diff --git a/src/main/java/net/minecraft/server/NetworkManager.java b/src/main/java/net/minecraft/server/NetworkManager.java
+index dc496e26e..2ae9c45f8 100644
+--- a/src/main/java/net/minecraft/server/NetworkManager.java
++++ b/src/main/java/net/minecraft/server/NetworkManager.java
+@@ -255,7 +255,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+     }
+ 
+     public void handle(Packet packet) {
+-        this.a(packet, null, (GenericFutureListener<? extends Future<? super Void>>) null); // PandaSpigot
++        this.a(packet, null, (GenericFutureListener<? extends Future<? super Void>>[]) null);
+     }
+ 
+     public void a(Packet packet, GenericFutureListener<? extends Future<? super Void>> genericfuturelistener, GenericFutureListener<? extends Future<? super Void>>... agenericfuturelistener) {

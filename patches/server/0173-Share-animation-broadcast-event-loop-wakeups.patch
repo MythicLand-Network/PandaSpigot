@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Sat, 21 Nov 2026 17:28:00 +0800
+Subject: [PATCH] Share animation broadcast event loop wakeups
+
+diff --git a/src/main/java/net/minecraft/server/AnimationBroadcast.java b/src/main/java/net/minecraft/server/AnimationBroadcast.java
+new file mode 100644
+index 000000000..5c3b1f42c
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/AnimationBroadcast.java
+@@ -0,0 +1,53 @@
++package net.minecraft.server;
++
++import io.netty.channel.Channel;
++import io.netty.channel.EventLoop;
++import io.netty.channel.SingleThreadEventLoop;
++import java.util.Collections;
++import java.util.IdentityHashMap;
++import java.util.Set;
++import java.util.concurrent.RejectedExecutionException;
++
++final class AnimationBroadcast {
++    private static final ThreadLocal<AnimationBroadcast> LOCAL = ThreadLocal.withInitial(AnimationBroadcast::new);
++    private static final Runnable WAKE = () -> {};
++
++    private final Set<EventLoop> transports = Collections.newSetFromMap(new IdentityHashMap<>());
++    private PacketPlayOutAnimation packet;
++
++    static AnimationBroadcast begin(PacketPlayOutAnimation packet) {
++        AnimationBroadcast batch = LOCAL.get();
++        if (batch.packet != null) return null;
++        batch.packet = packet;
++        return batch;
++    }
++
++    void finish() {
++        this.packet = null;
++        RejectedExecutionException failure = null;
++        try {
++            for (EventLoop loop : this.transports) {
++                try {
++                    loop.execute(WAKE);
++                } catch (RejectedExecutionException rejected) {
++                    if (!loop.isShuttingDown()) failure = rejected;
++                }
++            }
++        } finally {
++            this.transports.clear();
++        }
++        if (failure != null) throw failure;
++    }
++
++    static boolean defer(Packet packet, Channel channel, EventLoop dispatch, Thread thread) {
++        AnimationBroadcast batch = LOCAL.get();
++        if (batch.packet != packet || thread == null) return false;
++        EventLoop transport = channel.pipeline().channel().eventLoop();
++        if (!(transport instanceof SingleThreadEventLoop) || !transport.inEventLoop(thread)) return false;
++        if (dispatch != transport && !dispatch.inEventLoop(thread)) return false;
++        // Submit the original write through the dispatch loop so packet listeners run normally.
++        // Clients registered on the same transport need just one wakeup at the end of this broadcast.
++        batch.transports.add(transport);
++        return true;
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/EntityTracker.java b/src/main/java/net/minecraft/server/EntityTracker.java
+index cb72b3672..f784e3148 100644
+--- a/src/main/java/net/minecraft/server/EntityTracker.java
++++ b/src/main/java/net/minecraft/server/EntityTracker.java
+@@ -222,10 +222,16 @@ public class EntityTracker {
+     public void sendPacketToEntity(Entity entity, Packet packet) {
+         EntityTrackerEntry entitytrackerentry = (EntityTrackerEntry) this.trackedEntities.get(entity.getId());
+ 
+-        if (entitytrackerentry != null) {
++        if (entitytrackerentry == null) return;
++        AnimationBroadcast batch = null;
++        if (packet instanceof PacketPlayOutAnimation && entitytrackerentry.trackedPlayers.size() >= 3) {
++            batch = AnimationBroadcast.begin((PacketPlayOutAnimation) packet);
++        }
++        try {
+             entitytrackerentry.broadcastIncludingSelf(packet);
++        } finally {
++            if (batch != null) batch.finish();
+         }
+-
+     }
+ 
+     public void untrackPlayer(EntityPlayer entityplayer) {
+diff --git a/src/main/java/net/minecraft/server/NetworkFlushHandler.java b/src/main/java/net/minecraft/server/NetworkFlushHandler.java
+index 43d51cfa3..350050ed2 100644
+--- a/src/main/java/net/minecraft/server/NetworkFlushHandler.java
++++ b/src/main/java/net/minecraft/server/NetworkFlushHandler.java
+@@ -1,14 +1,36 @@
+ package net.minecraft.server;
+ 
+ import io.netty.channel.Channel;
++import io.netty.channel.ChannelFuture;
+ import io.netty.channel.ChannelHandlerContext;
+ import io.netty.channel.ChannelOutboundHandlerAdapter;
+ import io.netty.channel.ChannelPromise;
+ import io.netty.channel.EventLoop;
+ import io.netty.util.concurrent.SingleThreadEventExecutor;
++import java.util.concurrent.RejectedExecutionException;
+ 
+ final class NetworkFlushHandler extends ChannelOutboundHandlerAdapter {
+     private volatile boolean pendingWrites;
++    private boolean animationFlushQueued;
++
++    ChannelFuture writeAnimation(Channel channel, Packet animation) {
++        ChannelFuture written = channel.write(animation);
++        if (this.animationFlushQueued) return written;
++
++        this.animationFlushQueued = true;
++        // A busy viewer can receive several swings in this loop turn. An intervening urgent flush
++        // still takes effect immediately and the queued task then has nothing to flush.
++        try {
++            channel.pipeline().channel().eventLoop().execute(() -> {
++                this.animationFlushQueued = false;
++                if (this.pendingWrites) channel.flush();
++            });
++        } catch (RejectedExecutionException rejected) {
++            this.animationFlushQueued = false;
++            channel.flush();
++        }
++        return written;
++    }
+ 
+     @Override
+     public void write(ChannelHandlerContext ctx, Object message, ChannelPromise promise) throws Exception {
+diff --git a/src/main/java/net/minecraft/server/NetworkManager.java b/src/main/java/net/minecraft/server/NetworkManager.java
+index 245a09a8f..dc496e26e 100644
+--- a/src/main/java/net/minecraft/server/NetworkManager.java
++++ b/src/main/java/net/minecraft/server/NetworkManager.java
+@@ -90,6 +90,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+ 
+     // PandaSpigot start - Allow controlled flushing
+     private volatile Thread flushBatchOwner;
++    private volatile Thread transportThread;
+     private final java.util.concurrent.atomic.AtomicInteger packetWrites = new java.util.concurrent.atomic.AtomicInteger();
+     private int flushPacketsStart;
+     private final Object flushLock = new Object();
+@@ -155,6 +156,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+     public void channelActive(ChannelHandlerContext channelhandlercontext) throws Exception {
+         super.channelActive(channelhandlercontext);
+         this.channel = channelhandlercontext.channel();
++        this.transportThread = Thread.currentThread();
+         this.channel.pipeline().addFirst("pending_flush", this.flushHandler); // PandaSpigot - Observe all outbound writes and actual flushes
+         this.l = this.channel.remoteAddress();
+         // Spigot Start
+@@ -349,6 +351,9 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+             }
+             // PandaSpigot end
+         } else {
++            boolean broadcastAnimation = flush && packet instanceof PacketPlayOutAnimation
++                    && eventLoop instanceof AbstractEventExecutor
++                    && AnimationBroadcast.defer(packet, this.channel, eventLoop, this.transportThread);
+             Runnable write = new Runnable() {
+                 public void run() {
+                     if (enumprotocol != enumprotocol1) {
+@@ -363,7 +368,12 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+                     }
+                     try {
+                     // PandaSpigot end
+-                    ChannelFuture channelfuture = flush ? NetworkManager.this.channel.writeAndFlush(packet) : NetworkManager.this.channel.write(packet); // PandaSpigot - Add flush parameter
++                    ChannelFuture channelfuture;
++                    if (broadcastAnimation) {
++                        channelfuture = flushHandler.writeAnimation(NetworkManager.this.channel, packet);
++                    } else {
++                        channelfuture = flush ? NetworkManager.this.channel.writeAndFlush(packet) : NetworkManager.this.channel.write(packet);
++                    }
+ 
+                     if (agenericfuturelistener != null) {
+                         channelfuture.addListeners(agenericfuturelistener);
+@@ -389,6 +399,8 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+             // Concurrent senders may race that flush and must wake the loop themselves.
+             if (!flush && batchOwner == Thread.currentThread() && eventLoop instanceof AbstractEventExecutor) {
+                 ((AbstractEventExecutor) eventLoop).lazyExecute(write);
++            } else if (broadcastAnimation) {
++                ((AbstractEventExecutor) eventLoop).lazyExecute(write);
+             } else {
+                 eventLoop.execute(write);
+             }
+diff --git a/src/test/java/net/minecraft/server/NetworkFlushTest.java b/src/test/java/net/minecraft/server/NetworkFlushTest.java
+index ffd3f3382..888745f50 100644
+--- a/src/test/java/net/minecraft/server/NetworkFlushTest.java
++++ b/src/test/java/net/minecraft/server/NetworkFlushTest.java
+@@ -163,8 +163,86 @@ public class NetworkFlushTest extends AbstractTestingBase {
+         }
+     }
+ 
++    @Test
++    public void queuedAnimationsShareAFlushAndUrgentWritesStillFlushImmediately() throws Exception {
++        DefaultEventLoop loop = new DefaultEventLoop();
++        LocalChannel channel = new LocalChannel();
++        List<Object> messages = new ArrayList<>();
++        CountingFlush counter = new CountingFlush() {
++            @Override
++            public void write(ChannelHandlerContext ctx, Object message, ChannelPromise promise) {
++                messages.add(message);
++                promise.setSuccess();
++            }
++        };
++        NetworkFlushHandler handler = new NetworkFlushHandler();
++        Packet first = new PacketPlayOutAnimation();
++        Packet second = new PacketPlayOutAnimation();
++        Packet urgent = new PacketPlayOutKeepAlive(7);
++        try {
++            loop.register(channel).sync();
++            channel.pipeline().addLast(counter, handler);
++            loop.submit(() -> {
++                handler.writeAnimation(channel, first);
++                handler.writeAnimation(channel, second);
++                assertEquals(0, counter.flushes);
++            }).sync();
++            loop.submit(() -> {
++                assertEquals(1, counter.flushes);
++                handler.writeAnimation(channel, first);
++                channel.writeAndFlush(urgent);
++                assertEquals(2, counter.flushes);
++            }).sync();
++            loop.submit(() -> {
++                assertEquals(2, counter.flushes);
++                assertEquals(Arrays.asList(first, second, first, urgent), messages);
++            }).sync();
++        } finally {
++            channel.close().sync();
++            loop.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS).sync();
++        }
++    }
++
++    @Test
++    public void animationViewersOnTheSameTransportShareOneWakeup() throws Exception {
++        RecordingEventLoop loop = new RecordingEventLoop();
++        LocalChannel first = new LocalChannel();
++        LocalChannel second = new LocalChannel();
++        try {
++            loop.register(first).sync();
++            loop.register(second).sync();
++            Thread transport = loop.submit(Thread::currentThread).sync().getNow();
++            PacketPlayOutAnimation animation = new PacketPlayOutAnimation();
++            AnimationBroadcast batch = AnimationBroadcast.begin(animation);
++            try {
++                PacketPlayOutAnimation nested = new PacketPlayOutAnimation();
++                assertNull(AnimationBroadcast.begin(nested));
++                assertFalse(AnimationBroadcast.defer(nested, first, loop, transport));
++                assertFalse(AnimationBroadcast.defer(animation, first, loop, Thread.currentThread()));
++                assertTrue(AnimationBroadcast.defer(animation, first, loop, transport));
++                assertTrue(AnimationBroadcast.defer(animation, second, loop, transport));
++            } finally {
++                int previous = loop.submissions.get();
++                batch.finish();
++                assertEquals(previous + 1, loop.submissions.get());
++            }
++            assertFalse(AnimationBroadcast.defer(animation, first, loop, transport));
++        } finally {
++            first.close().sync();
++            second.close().sync();
++            loop.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS).sync();
++        }
++    }
++
+     private static class RecordingEventLoop extends DefaultEventLoop {
+         private final AtomicInteger lazyWrites = new AtomicInteger();
++        private final AtomicInteger submissions = new AtomicInteger();
++
++        @Override
++        public void execute(Runnable task) {
++            submissions.incrementAndGet();
++            super.execute(task);
++        }
+ 
+         @Override
+         public void lazyExecute(Runnable task) {

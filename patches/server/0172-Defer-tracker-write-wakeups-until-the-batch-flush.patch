@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Sat, 21 Nov 2026 17:00:00 +0800
+Subject: [PATCH] Defer tracker write wakeups until the batch flush
+
+diff --git a/src/main/java/net/minecraft/server/NetworkManager.java b/src/main/java/net/minecraft/server/NetworkManager.java
+index 9f509d01b..245a09a8f 100644
+--- a/src/main/java/net/minecraft/server/NetworkManager.java
++++ b/src/main/java/net/minecraft/server/NetworkManager.java
+@@ -8,6 +8,7 @@ import io.netty.channel.Channel;
+ import io.netty.channel.ChannelFuture;
+ import io.netty.channel.ChannelFutureListener;
+ import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.EventLoop;
+ import io.netty.channel.SimpleChannelInboundHandler;
+ import io.netty.channel.epoll.EpollEventLoopGroup;
+ import io.netty.channel.local.LocalChannel;
+@@ -16,6 +17,7 @@ import io.netty.channel.local.LocalServerChannel;
+ import io.netty.channel.nio.NioEventLoopGroup;
+ import io.netty.handler.timeout.TimeoutException;
+ import io.netty.util.AttributeKey;
++import io.netty.util.concurrent.AbstractEventExecutor;
+ import io.netty.util.concurrent.Future;
+ import io.netty.util.concurrent.GenericFutureListener;
+ import java.net.SocketAddress;
+@@ -87,7 +89,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+     // PandaSpigot end
+ 
+     // PandaSpigot start - Allow controlled flushing
+-    volatile boolean canFlush = true;
++    private volatile Thread flushBatchOwner;
+     private final java.util.concurrent.atomic.AtomicInteger packetWrites = new java.util.concurrent.atomic.AtomicInteger();
+     private int flushPacketsStart;
+     private final Object flushLock = new Object();
+@@ -95,15 +97,15 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+ 
+     public void disableAutomaticFlush() {
+         synchronized (this.flushLock) {
+-            this.flushPacketsStart = this.packetWrites.get(); // must be volatile and before canFlush = false
+-            this.canFlush = false;
++            this.flushPacketsStart = this.packetWrites.get();
++            this.flushBatchOwner = Thread.currentThread();
+         }
+     }
+ 
+     public void enableAutomaticFlush() {
+         synchronized (this.flushLock) {
+-            this.canFlush = true;
+-            if (this.packetWrites.get() != this.flushPacketsStart) { // must be after canFlush = true
++            this.flushBatchOwner = null;
++            if (this.packetWrites.get() != this.flushPacketsStart) {
+                 this.flush(); // only make the flush call if we need to
+             }
+         }
+@@ -299,8 +301,9 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+         this.writePacket(packet, agenericfuturelistener, Boolean.TRUE);
+     }
+     private void writePacket(final Packet packet, final GenericFutureListener<? extends Future<? super Void>>[] agenericfuturelistener, Boolean flushConditional) {
+-        this.packetWrites.getAndIncrement(); // must be before using canFlush
+-        boolean effectiveFlush = flushConditional == null ? this.canFlush : flushConditional.booleanValue();
++        this.packetWrites.getAndIncrement(); // Count the write before inspecting the batch.
++        Thread batchOwner = this.flushBatchOwner;
++        boolean effectiveFlush = flushConditional == null ? batchOwner == null : flushConditional.booleanValue();
+         final boolean flush = effectiveFlush || packet instanceof PacketPlayOutKeepAlive || packet instanceof PacketPlayOutKickDisconnect; // no delay for certain packets
+         // PandaSpigot end
+         final EnumProtocol enumprotocol = EnumProtocol.a(packet);
+@@ -311,7 +314,8 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+             this.channel.config().setAutoRead(false);
+         }
+ 
+-        if (this.channel.eventLoop().inEventLoop()) {
++        EventLoop eventLoop = this.channel.eventLoop();
++        if (eventLoop.inEventLoop()) {
+             if (enumprotocol != enumprotocol1) {
+                 this.a(enumprotocol);
+             }
+@@ -345,7 +349,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+             }
+             // PandaSpigot end
+         } else {
+-            this.channel.eventLoop().execute(new Runnable() {
++            Runnable write = new Runnable() {
+                 public void run() {
+                     if (enumprotocol != enumprotocol1) {
+                         NetworkManager.this.a(enumprotocol);
+@@ -380,7 +384,14 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+                     }
+                     // PandaSpigot end
+                 }
+-            });
++            };
++            // The tracker thread submits a waking flush after its own writes in a finally block.
++            // Concurrent senders may race that flush and must wake the loop themselves.
++            if (!flush && batchOwner == Thread.currentThread() && eventLoop instanceof AbstractEventExecutor) {
++                ((AbstractEventExecutor) eventLoop).lazyExecute(write);
++            } else {
++                eventLoop.execute(write);
++            }
+         }
+ 
+     }
+@@ -405,7 +416,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+     private boolean processQueue() {
+         if (i.isEmpty()) return true;
+         // PandaSpigot start - Make only one flush call per sendPacketQueue() call
+-        final boolean needsFlush = this.canFlush;
++        final boolean needsFlush = this.flushBatchOwner == null;
+         boolean hasWrotePacket = false;
+         // PandaSpigot end
+         // If we are on main, we are safe here in that nothing else should be processing queue off main anymore
+@@ -421,7 +432,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+             Packet<?> packet = queued.getPacket();
+             if (!packet.isReady()) {
+                 // PandaSpigot start - Make only one flush call per sendPacketQueue() call
+-                if (hasWrotePacket && (needsFlush || this.canFlush)) {
++                if (hasWrotePacket && (needsFlush || this.flushBatchOwner == null)) {
+                     this.flush();
+                 }
+                 // PandaSpigot end
+@@ -429,7 +440,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+             } else {
+                 iterator.remove();
+                 // PandaSpigot start - Make only one flush call per sendPacketQueue() call
+-                this.writePacket(packet, queued.getGenericFutureListener(), (!iterator.hasNext() && (needsFlush || this.canFlush)) ? Boolean.TRUE : Boolean.FALSE);
++                this.writePacket(packet, queued.getGenericFutureListener(), (!iterator.hasNext() && (needsFlush || this.flushBatchOwner == null)) ? Boolean.TRUE : Boolean.FALSE);
+                 hasWrotePacket = true;
+                 // PandaSpigot end
+             }
+diff --git a/src/test/java/net/minecraft/server/NetworkFlushTest.java b/src/test/java/net/minecraft/server/NetworkFlushTest.java
+index 67c856a7c..ffd3f3382 100644
+--- a/src/test/java/net/minecraft/server/NetworkFlushTest.java
++++ b/src/test/java/net/minecraft/server/NetworkFlushTest.java
+@@ -8,6 +8,10 @@ import io.netty.channel.DefaultEventLoop;
+ import io.netty.channel.embedded.EmbeddedChannel;
+ import io.netty.channel.local.LocalChannel;
+ import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicInteger;
+ import org.bukkit.support.AbstractTestingBase;
+ import org.junit.Test;
+ 
+@@ -115,6 +119,60 @@ public class NetworkFlushTest extends AbstractTestingBase {
+         }
+     }
+ 
++    @Test
++    public void onlyTrackerWritesMayWaitForTheClosingFlush() throws Exception {
++        Field config = PandaSpigotConfig.class.getDeclaredField("config");
++        config.setAccessible(true);
++        Object previous = config.get(null);
++        RecordingEventLoop loop = new RecordingEventLoop();
++        LocalChannel channel = new LocalChannel();
++        List<Object> writes = new ArrayList<>();
++        try {
++            config.set(null, new PandaSpigotConfig());
++            loop.register(channel).sync();
++            channel.pipeline().addLast(new ChannelOutboundHandlerAdapter() {
++                @Override
++                public void write(ChannelHandlerContext ctx, Object message, ChannelPromise promise) {
++                    writes.add(message);
++                    promise.setSuccess();
++                }
++            });
++            NetworkManager network = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++            network.channel = channel;
++            channel.attr(NetworkManager.c).set(EnumProtocol.PLAY);
++            Packet first = new PacketPlayOutEntityVelocity(1, 0, 0, 0);
++            Packet concurrent = new PacketPlayOutEntityVelocity(2, 0, 0, 0);
++            Packet urgent = new PacketPlayOutKeepAlive(1);
++            Packet last = new PacketPlayOutEntityVelocity(3, 0, 0, 0);
++            network.disableAutomaticFlush();
++            network.handle(first);
++            Thread sender = new Thread(() -> network.handle(concurrent));
++            sender.start();
++            sender.join();
++            network.handle(urgent);
++            network.handle(last);
++            network.enableAutomaticFlush();
++
++            loop.submit(() -> {}).sync();
++            assertEquals(2, loop.lazyWrites.get());
++            assertEquals(Arrays.asList(first, concurrent, urgent, last), writes);
++        } finally {
++            channel.close().sync();
++            loop.shutdownGracefully(0, 0, java.util.concurrent.TimeUnit.MILLISECONDS).sync();
++            config.set(null, previous);
++        }
++    }
++
++    private static class RecordingEventLoop extends DefaultEventLoop {
++        private final AtomicInteger lazyWrites = new AtomicInteger();
++
++        @Override
++        public void lazyExecute(Runnable task) {
++            lazyWrites.incrementAndGet();
++            super.lazyExecute(task);
++        }
++    }
++
+     private static class CountingFlush extends ChannelOutboundHandlerAdapter {
+         int flushes;
+ 

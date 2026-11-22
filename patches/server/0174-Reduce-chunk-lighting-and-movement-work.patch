@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Sat, 21 Nov 2026 19:20:00 +0800
+Subject: [PATCH] Reduce chunk lighting and movement work
+
+diff --git a/src/main/java/net/minecraft/server/BiomeCache.java b/src/main/java/net/minecraft/server/BiomeCache.java
+index d67b14b10..1b06c5f5e 100644
+--- a/src/main/java/net/minecraft/server/BiomeCache.java
++++ b/src/main/java/net/minecraft/server/BiomeCache.java
+@@ -73,8 +73,16 @@ public class BiomeCache {
+         public BiomeCacheBlock(int i, int j) {
+             this.c = i;
+             this.d = j;
+-            BiomeCache.this.a.getWetness(this.a, i << 4, j << 4, 16, 16);
+-            BiomeCache.this.a.a(this.b, i << 4, j << 4, 16, 16, false);
++            WorldChunkManager manager = BiomeCache.this.a;
++            if (manager.getClass() == WorldChunkManager.class) {
++                manager.a(this.b, i << 4, j << 4, 16, 16, false);
++                for (int cell = 0; cell < this.b.length; cell++) {
++                    this.a[cell] = Math.min(1.0F, this.b[cell].h() / 65536.0F);
++                }
++            } else {
++                manager.getWetness(this.a, i << 4, j << 4, 16, 16);
++                manager.a(this.b, i << 4, j << 4, 16, 16, false);
++            }
+         }
+ 
+         public BiomeBase a(int i, int j) {
+diff --git a/src/main/java/net/minecraft/server/ChunkRegionLoader.java b/src/main/java/net/minecraft/server/ChunkRegionLoader.java
+index 2ce80c31d..86242bd1a 100644
+--- a/src/main/java/net/minecraft/server/ChunkRegionLoader.java
++++ b/src/main/java/net/minecraft/server/ChunkRegionLoader.java
+@@ -338,7 +338,6 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+         for (int k = 0; k < nbttaglist.size(); ++k) {
+             NBTTagCompound nbttagcompound1 = nbttaglist.get(k);
+             byte b1 = nbttagcompound1.getByte("Y");
+-            ChunkSection chunksection = new ChunkSection(b1 << 4, flag);
+             byte[] abyte = nbttagcompound1.getByteArray("Blocks");
+             NibbleArray nibblearray = new NibbleArray(nbttagcompound1.getByteArray("Data"));
+             NibbleArray nibblearray1 = nbttagcompound1.hasKeyOfType("Add", 7) ? new NibbleArray(nbttagcompound1.getByteArray("Add")) : null;
+@@ -372,13 +371,12 @@ public class ChunkRegionLoader implements IChunkLoader, IAsyncChunkSaver {
+                 // CraftBukkit end
+             }
+ 
+-            chunksection.a(achar);
++            ChunkSection chunksection = new ChunkSection(b1 << 4, flag, achar);
+             chunksection.a(new NibbleArray(nbttagcompound1.getByteArray("BlockLight")));
+             if (flag) {
+                 chunksection.b(new NibbleArray(nbttagcompound1.getByteArray("SkyLight")));
+             }
+ 
+-            chunksection.recalcBlockCounts();
+             achunksection[b1] = chunksection;
+         }
+ 
+diff --git a/src/main/java/net/minecraft/server/Entity.java b/src/main/java/net/minecraft/server/Entity.java
+index e2b6f0a78..ae14e6323 100644
+--- a/src/main/java/net/minecraft/server/Entity.java
++++ b/src/main/java/net/minecraft/server/Entity.java
+@@ -546,33 +546,29 @@ public abstract class Entity implements ICommandListener {
+ 
+             AxisAlignedBB axisalignedbb = this.getBoundingBox();
+ 
+-            AxisAlignedBB axisalignedbb1;
+-
+-            for (Iterator iterator = list.iterator(); iterator.hasNext(); d1 = axisalignedbb1.b(this.getBoundingBox(), d1)) {
+-                axisalignedbb1 = (AxisAlignedBB) iterator.next();
++            if (d1 != 0.0D) {
++                for (int index = 0; index < list.size() && d1 != 0.0D; index++) {
++                    d1 = ((AxisAlignedBB) list.get(index)).b(this.getBoundingBox(), d1);
++                }
++                this.a(this.getBoundingBox().c(0.0D, d1, 0.0D));
+             }
+-
+-            this.a(this.getBoundingBox().c(0.0D, d1, 0.0D));
+             boolean flag1 = this.onGround || d7 != d1 && d7 < 0.0D;
+ 
+-            if (axisScan) list = this.world.getCubes(this, this.getBoundingBox().a(d0, 0, 0)); // PandaSpigot - get x axis blocks
+-
+-            AxisAlignedBB axisalignedbb2;
+-            Iterator iterator1;
+-
+-            for (iterator1 = list.iterator(); iterator1.hasNext(); d0 = axisalignedbb2.a(this.getBoundingBox(), d0)) {
+-                axisalignedbb2 = (AxisAlignedBB) iterator1.next();
++            if (axisScan) list = this.world.getCubes(this, this.getBoundingBox().a(d0, 0, 0));
++            if (d0 != 0.0D) {
++                for (int index = 0; index < list.size() && d0 != 0.0D; index++) {
++                    d0 = ((AxisAlignedBB) list.get(index)).a(this.getBoundingBox(), d0);
++                }
++                this.a(this.getBoundingBox().c(d0, 0.0D, 0.0D));
+             }
+ 
+-            this.a(this.getBoundingBox().c(d0, 0.0D, 0.0D));
+-
+-            if (axisScan) list = this.world.getCubes(this, this.getBoundingBox().a(0, 0, d2)); // PandaSpigot - get z axis blocks
+-
+-            for (iterator1 = list.iterator(); iterator1.hasNext(); d2 = axisalignedbb2.c(this.getBoundingBox(), d2)) {
+-                axisalignedbb2 = (AxisAlignedBB) iterator1.next();
++            if (axisScan) list = this.world.getCubes(this, this.getBoundingBox().a(0, 0, d2));
++            if (d2 != 0.0D) {
++                for (int index = 0; index < list.size() && d2 != 0.0D; index++) {
++                    d2 = ((AxisAlignedBB) list.get(index)).c(this.getBoundingBox(), d2);
++                }
++                this.a(this.getBoundingBox().c(0.0D, 0.0D, d2));
+             }
+-
+-            this.a(this.getBoundingBox().c(0.0D, 0.0D, d2));
+             if (this.S > 0.0F && flag1 && (d6 != d0 || d8 != d2)) {
+                 double d10 = d0;
+                 double d11 = d1;
+diff --git a/src/main/java/net/minecraft/server/World.java b/src/main/java/net/minecraft/server/World.java
+index 8cb76c9a4..534446964 100644
+--- a/src/main/java/net/minecraft/server/World.java
++++ b/src/main/java/net/minecraft/server/World.java
+@@ -776,13 +776,8 @@ public abstract class World implements IBlockAccess {
+ 
+     public int b(int i, int j) {
+         if (i >= -30000000 && j >= -30000000 && i < 30000000 && j < 30000000) {
+-            if (!this.isChunkLoaded(i >> 4, j >> 4, true)) {
+-                return 0;
+-            } else {
+-                Chunk chunk = this.getChunkAt(i >> 4, j >> 4);
+-
+-                return chunk.v();
+-            }
++            Chunk chunk = this.getChunkIfLoaded(i >> 4, j >> 4);
++            return chunk == null ? 0 : chunk.v();
+         } else {
+             return this.F() + 1;
+         }
+@@ -795,20 +790,16 @@ public abstract class World implements IBlockAccess {
+ 
+         if (!this.isValidLocation(blockposition)) {
+             return enumskyblock.c;
+-        } else if (!this.isLoaded(blockposition)) {
+-            return enumskyblock.c;
+         } else {
+-            Chunk chunk = this.getChunkAtWorldCoords(blockposition);
+-
+-            return chunk.getBrightness(enumskyblock, blockposition);
++            Chunk chunk = this.getChunkIfLoaded(blockposition);
++            return chunk == null ? enumskyblock.c : chunk.getBrightness(enumskyblock, blockposition);
+         }
+     }
+ 
+     public void a(EnumSkyBlock enumskyblock, BlockPosition blockposition, int i) {
+         if (this.isValidLocation(blockposition)) {
+-            if (this.isLoaded(blockposition)) {
+-                Chunk chunk = this.getChunkAtWorldCoords(blockposition);
+-
++            Chunk chunk = this.getChunkIfLoaded(blockposition);
++            if (chunk != null) {
+                 chunk.a(enumskyblock, blockposition, i);
+                 this.n(blockposition);
+             }
+@@ -1323,7 +1314,7 @@ public abstract class World implements IBlockAccess {
+                     {
+                         for ( int y = ystart; y < l; y++ )
+                         {
+-                            BlockPosition blockposition = new BlockPosition( x, y, z );
++                            blockposition_mutableblockposition.c(x, y, z);
+ 
+                             if (flag && flag1) {
+                                 entity.h(false);
+@@ -1332,13 +1323,13 @@ public abstract class World implements IBlockAccess {
+                             }
+ 
+                             IBlockData block; 
+-                            if (!this.getWorldBorder().a(blockposition) && flag1) {
++                            if (!worldborder.a(blockposition_mutableblockposition) && flag1) {
+                                 block = Blocks.STONE.getBlockData();
+                             } else 
+                             {
+-                                block = chunk.getBlockData( blockposition );
++                                block = chunk.getBlockData(blockposition_mutableblockposition);
+                             }
+-                            if ( block != null )
++                            if (block != null && block.getBlock() != Blocks.AIR)
+                             {
+                                 // PaperSpigot start - FallingBlocks and TNT collide with specific non-collidable blocks
+                                 Block b = block.getBlock();
+@@ -1346,7 +1337,7 @@ public abstract class World implements IBlockAccess {
+                                     AxisAlignedBB aabb = AxisAlignedBB.a(x, y, z, x + 1.0, y + 1.0, z + 1.0);
+                                     if (axisalignedbb.b(aabb)) arraylist.add(aabb);
+                                 } else {
+-                                    b.a(this, blockposition, block, axisalignedbb, arraylist, entity);
++                                    b.a(this, new BlockPosition(x, y, z), block, axisalignedbb, arraylist, entity);
+                                 }
+                                 // PaperSpigot end
+                             }
+@@ -2512,47 +2503,45 @@ public abstract class World implements IBlockAccess {
+         return flag;
+     }
+ 
+-    private int a(BlockPosition blockposition, EnumSkyBlock enumskyblock) {
+-        if (enumskyblock == EnumSkyBlock.SKY && this.i(blockposition)) {
+-            return 15;
+-        } else {
+-            Block block = this.getType(blockposition).getBlock();
+-            int i = enumskyblock == EnumSkyBlock.SKY ? 0 : block.r();
+-            int j = block.p();
+-
+-            if (j >= 15 && block.r() > 0) {
+-                j = 1;
+-            }
+-
+-            if (j < 1) {
+-                j = 1;
+-            }
+-
+-            if (j >= 15) {
+-                return 0;
+-            } else if (i >= 14) {
+-                return i;
++    private Chunk lightingChunk(BlockPosition position, Chunk origin) {
++        if (!this.isValidLocation(position)) return null;
++        int x = position.getX() >> 4;
++        int z = position.getZ() >> 4;
++        if (!this.paperSpigotConfig.useAsyncLighting && x == origin.locX && z == origin.locZ) return origin;
++        return this.getChunkIfLoaded(x, z);
++    }
++
++    private static final EnumDirection[] LIGHT_DIRECTIONS = EnumDirection.values();
++
++    private int propagatedBrightness(BlockPosition position, EnumSkyBlock light, Chunk center) {
++        if (light == EnumSkyBlock.SKY && (center != null ? center.d(position) : this.i(position))) return 15;
++
++        Block block = center == null || this.captureTreeGeneration
++                ? this.getType(position).getBlock() : center.getBlockData(position).getBlock();
++        int emission = block.r();
++        int brightness = light == EnumSkyBlock.SKY ? 0 : emission;
++        int opacity = Math.max(1, block.p());
++        if (opacity >= 15 && emission > 0) opacity = 1;
++        if (opacity >= 15) return 0;
++        int maximumFromNeighbor = 15 - opacity;
++        if (brightness >= maximumFromNeighbor) return brightness;
++
++        BlockPosition.MutableBlockPosition neighbor = new BlockPosition.MutableBlockPosition();
++        for (EnumDirection direction : LIGHT_DIRECTIONS) {
++            int x = position.getX() + direction.getAdjacentX();
++            int y = position.getY() + direction.getAdjacentY();
++            int z = position.getZ() + direction.getAdjacentZ();
++            neighbor.c(x, y, z);
++            int adjacent;
++            if (center != null && y >= 0 && y < 256 && (x >> 4) == center.locX && (z >> 4) == center.locZ) {
++                adjacent = center.getBrightness(light, neighbor);
+             } else {
+-                EnumDirection[] aenumdirection = EnumDirection.values();
+-                int k = aenumdirection.length;
+-
+-                for (int l = 0; l < k; ++l) {
+-                    EnumDirection enumdirection = aenumdirection[l];
+-                    BlockPosition blockposition1 = blockposition.shift(enumdirection);
+-                    int i1 = this.b(enumskyblock, blockposition1) - j;
+-
+-                    if (i1 > i) {
+-                        i = i1;
+-                    }
+-
+-                    if (i >= 14) {
+-                        return i;
+-                    }
+-                }
+-
+-                return i;
++                adjacent = this.b(light, neighbor);
+             }
++            brightness = Math.max(brightness, adjacent - opacity);
++            if (brightness >= maximumFromNeighbor) break;
+         }
++        return brightness;
+     }
+ 
+     public boolean c(EnumSkyBlock enumskyblock, BlockPosition blockposition, Chunk chunk, List<Chunk> neighbors) { // PaperSpigot
+@@ -2566,8 +2555,9 @@ public abstract class World implements IBlockAccess {
+             int j = 0;
+ 
+             this.methodProfiler.a("getBrightness");
+-            int k = this.b(enumskyblock, blockposition);
+-            int l = this.a(blockposition, enumskyblock);
++            Chunk center = this.lightingChunk(blockposition, chunk);
++            int k = center == null ? this.b(enumskyblock, blockposition) : center.getBrightness(enumskyblock, blockposition);
++            int l = this.propagatedBrightness(blockposition, enumskyblock, center);
+             int i1 = blockposition.getX();
+             int j1 = blockposition.getY();
+             int k1 = blockposition.getZ();
+@@ -2636,9 +2626,10 @@ public abstract class World implements IBlockAccess {
+                 j2 = (l1 >> 6 & 63) - 32 + j1;
+                 k2 = (l1 >> 12 & 63) - 32 + k1;
+                 BlockPosition blockposition2 = new BlockPosition(i2, j2, k2);
+-                int k5 = this.b(enumskyblock, blockposition2);
++                center = this.lightingChunk(blockposition2, chunk);
++                int k5 = center == null ? this.b(enumskyblock, blockposition2) : center.getBrightness(enumskyblock, blockposition2);
+ 
+-                l2 = this.a(blockposition2, enumskyblock);
++                l2 = this.propagatedBrightness(blockposition2, enumskyblock, center);
+                 if (l2 != k5) {
+                     this.a(enumskyblock, blockposition2, l2);
+                     if (l2 > k5) {
