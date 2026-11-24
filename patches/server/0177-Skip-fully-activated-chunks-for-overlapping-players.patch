@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Mon, 23 Nov 2026 19:15:00 +0800
+Subject: [PATCH] Skip fully activated chunks for overlapping players
+
+diff --git a/src/main/java/org/spigotmc/ActivationRange.java b/src/main/java/org/spigotmc/ActivationRange.java
+--- a/src/main/java/org/spigotmc/ActivationRange.java
++++ b/src/main/java/org/spigotmc/ActivationRange.java
+@@ -2,6 +2,8 @@
+ 
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Collections;
++import java.util.IdentityHashMap;
+ import java.util.Set;
+ import net.minecraft.server.AxisAlignedBB;
+ import net.minecraft.server.Chunk;
+@@ -110,6 +112,10 @@
+         maxRange = Math.max( maxRange, miscActivationRange );
+         maxRange = Math.min( ( world.spigotConfig.viewDistance << 4 ) - 8, maxRange );
+ 
++        // PandaSpigot start - Players sharing a chunk need only one pass once every entity is active.
++        Set<Chunk> fullyActive = world.players.size() > 1
++                ? Collections.newSetFromMap( new IdentityHashMap<Chunk, Boolean>() ) : null;
++        // PandaSpigot end
+         for ( Entity player : (List<Entity>) (List) world.players )
+         {
+ 
+@@ -132,7 +138,13 @@
+                     Chunk chunk = world.getChunkIfLoaded( i1, j1 );
+                     if ( chunk != null )
+                     {
+-                        activateChunkEntities( chunk );
++                        if ( fullyActive == null || !fullyActive.contains( chunk ) )
++                        {
++                            if ( activateChunkEntities( chunk ) && fullyActive != null )
++                            {
++                                fullyActive.add( chunk );
++                            }
++                        }
+                     // PandaSpigot end
+                     }
+                 }
+@@ -146,10 +158,12 @@
+      *
+      * @param chunk
+      */
+-    private static void activateChunkEntities(Chunk chunk)
+-    {
++    private static boolean activateChunkEntities(Chunk chunk)
++    {
++        boolean fullyActive = true; // PandaSpigot
+         for ( List<Entity> slice : chunk.entitySlices )
+         {
++            if ( slice.isEmpty() ) continue; // PandaSpigot
+             for ( Entity entity : slice )
+             {
+                 if ( MinecraftServer.currentTick > entity.activatedTick )
+@@ -159,30 +173,21 @@
+                         entity.activatedTick = MinecraftServer.currentTick;
+                         continue;
+                     }
+-                    switch ( entity.activationType )
+-                    {
+-                        case 1:
+-                            if ( monsterBB.b( entity.getBoundingBox() ) )
+-                            {
+-                                entity.activatedTick = MinecraftServer.currentTick;
+-                            }
+-                            break;
+-                        case 2:
+-                            if ( animalBB.b( entity.getBoundingBox() ) )
+-                            {
+-                                entity.activatedTick = MinecraftServer.currentTick;
+-                            }
+-                            break;
+-                        case 3:
+-                        default:
+-                            if ( miscBB.b( entity.getBoundingBox() ) )
+-                            {
+-                                entity.activatedTick = MinecraftServer.currentTick;
+-                            }
++                    // PandaSpigot start - Leave a partial chunk eligible for the next player's bounds.
++                    AxisAlignedBB range = entity.activationType == 1 ? monsterBB
++                            : entity.activationType == 2 ? animalBB : miscBB;
++                    if ( range.b( entity.getBoundingBox() ) )
++                    {
++                        entity.activatedTick = MinecraftServer.currentTick;
++                    } else
++                    {
++                        fullyActive = false;
+                     }
+-                }
+-            }
+-        }
++                    // PandaSpigot end
++                }
++            }
++        }
++        return fullyActive; // PandaSpigot
+     }
+ 
+     /**
+diff --git a/src/test/java/org/spigotmc/ActivationRangeTest.java b/src/test/java/org/spigotmc/ActivationRangeTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/org/spigotmc/ActivationRangeTest.java
+@@ -0,0 +1,38 @@
++package org.spigotmc;
++
++import java.lang.reflect.Method;
++import net.minecraft.server.AxisAlignedBB;
++import net.minecraft.server.Chunk;
++import net.minecraft.server.EntityItem;
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class ActivationRangeTest extends AbstractTestingBase {
++    @Test
++    public void anotherPlayerCanActivateRemainingEntitiesInTheSameChunk() throws Exception {
++        Method scan = ActivationRange.class.getDeclaredMethod("activateChunkEntities", Chunk.class);
++        scan.setAccessible(true);
++        Chunk chunk = new Chunk(null, 0, 0);
++        EntityItem near = new EntityItem(null, 1, 64, 1);
++        EntityItem far = new EntityItem(null, 15, 64, 1);
++        near.activatedTick = far.activatedTick = MinecraftServer.currentTick - 1L;
++        chunk.entitySlices[4].add(near);
++        chunk.entitySlices[4].add(far);
++        AxisAlignedBB previous = ActivationRange.miscBB;
++        try {
++            ActivationRange.miscBB = new AxisAlignedBB(0, 60, 0, 3, 68, 3);
++            assertEquals(false, scan.invoke(null, chunk));
++            assertEquals(MinecraftServer.currentTick, near.activatedTick);
++            assertTrue(far.activatedTick < MinecraftServer.currentTick);
++
++            ActivationRange.miscBB = new AxisAlignedBB(13, 60, 0, 16, 68, 3);
++            assertEquals(true, scan.invoke(null, chunk));
++            assertEquals(MinecraftServer.currentTick, far.activatedTick);
++        } finally {
++            ActivationRange.miscBB = previous;
++        }
++    }
++}
