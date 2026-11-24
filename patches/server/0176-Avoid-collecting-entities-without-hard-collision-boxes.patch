@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Mon, 23 Nov 2026 09:30:00 +0800
+Subject: [PATCH] Avoid collecting entities without hard collision boxes
+
+diff --git a/src/main/java/net/minecraft/server/World.java b/src/main/java/net/minecraft/server/World.java
+--- a/src/main/java/net/minecraft/server/World.java
++++ b/src/main/java/net/minecraft/server/World.java
+@@ -1354,7 +1354,9 @@
+         if (entity instanceof EntityArmorStand) return arraylist; // PandaSpigot - Optimize armor stand movement
+ 
+         double d0 = 0.25D;
+-        List list = this.getEntities(entity, axisalignedbb.grow(d0, d0, d0));
++        // PandaSpigot start - Avoid collecting entities with no hard collision box in dense bot groups.
++        List list = this.a(entity, axisalignedbb.grow(d0, d0, d0), collisionSelector(entity));
++        // PandaSpigot end
+ 
+         for (int j2 = 0; j2 < list.size(); ++j2) {
+             if (entity.passenger != list && entity.vehicle != list) {
+@@ -1373,6 +1375,50 @@
+ 
+         return arraylist;
+     }
++
++    // PandaSpigot start
++    static final Predicate<Entity> HARD_COLLISIONS = candidate -> IEntitySelector.d.apply(candidate) && candidate.S() != null;
++    private static final ClassValue<CollisionMethods> COLLISION_METHODS = new ClassValue<CollisionMethods>() {
++        @Override
++        protected CollisionMethods computeValue(Class<?> type) {
++            try {
++                Class<?> boxOwner = type.getMethod("S").getDeclaringClass();
++                boolean entityBox = boxOwner != Entity.class && boxOwner != EntityMinecartAbstract.class;
++                boolean specificBox = type.getMethod("j", Entity.class).getDeclaringClass() != Entity.class;
++                boolean multipart = type.getMethod("aB").getDeclaringClass() != Entity.class;
++                return new CollisionMethods(entityBox, specificBox, multipart);
++            } catch (NoSuchMethodException failure) {
++                throw new IllegalStateException("Cannot inspect collision methods for " + type.getName(), failure);
++            }
++        }
++    };
++
++    static Predicate<Entity> collisionSelector(Entity moving) {
++        if (!COLLISION_METHODS.get(moving.getClass()).specificBox) return HARD_COLLISIONS;
++        return candidate -> hasCollisionBox(moving, candidate);
++    }
++
++    static boolean canProvideHardCollisionBox(Entity entity) {
++        CollisionMethods methods = COLLISION_METHODS.get(entity.getClass());
++        return methods.entityBox || methods.multipart;
++    }
++
++    static boolean hasCollisionBox(Entity moving, Entity candidate) {
++        return IEntitySelector.d.apply(candidate) && (candidate.S() != null || moving.j(candidate) != null);
++    }
++
++    private static final class CollisionMethods {
++        private final boolean entityBox;
++        private final boolean specificBox;
++        private final boolean multipart;
++
++        private CollisionMethods(boolean entityBox, boolean specificBox, boolean multipart) {
++            this.entityBox = entityBox;
++            this.specificBox = specificBox;
++            this.multipart = multipart;
++        }
++    }
++    // PandaSpigot end
+ 
+     public boolean a(WorldBorder worldborder, Entity entity) {
+         double d0 = worldborder.b();
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -42,6 +42,7 @@
+     private final int[] itemCounts = new int[16];
+     private final int[] inventoryEntityCounts = new int[16];
+     private int minecartOrMultipartCount;
++    private int hardCollisionEntityCount; // PandaSpigot - Includes custom boxes and multipart candidates.
+     // PaperSpigot end
+     private boolean done;
+     private boolean lit;
+@@ -753,6 +754,7 @@
+         entity.af = k;
+         entity.ag = this.locZ;
+         this.entitySlices[k].add(entity);
++        if (World.canProvideHardCollisionBox(entity)) ++this.hardCollisionEntityCount; // PandaSpigot
+         if (entity instanceof EntityMinecartAbstract || entity.aB() != null) {
+             ++this.minecartOrMultipartCount;
+         }
+@@ -795,6 +797,7 @@
+         }
+ 
+         if (!this.entitySlices[i].remove(entity)) return; // PandaSpigot
++        if (World.canProvideHardCollisionBox(entity)) --this.hardCollisionEntityCount; // PandaSpigot
+         if (entity instanceof EntityMinecartAbstract || entity.aB() != null) {
+             --this.minecartOrMultipartCount;
+         }
+@@ -990,6 +993,7 @@
+ 
+     public void a(Entity entity, AxisAlignedBB axisalignedbb, List<Entity> list, Predicate<? super Entity> predicate) {
+         if (this.minecartOrMultipartCount == 0 && predicate == EntityArmorStand.MINECARTS) return;
++        if (this.hardCollisionEntityCount == 0 && predicate == World.HARD_COLLISIONS) return; // PandaSpigot
+         int i = MathHelper.floor((axisalignedbb.b - 2.0D) / 16.0D);
+         int j = MathHelper.floor((axisalignedbb.e + 2.0D) / 16.0D);
+ 
+diff --git a/src/test/java/net/minecraft/server/WorldEntityCollisionTest.java b/src/test/java/net/minecraft/server/WorldEntityCollisionTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/WorldEntityCollisionTest.java
+@@ -0,0 +1,157 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.Iterator;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class WorldEntityCollisionTest extends AbstractTestingBase {
++    private static int nextEntityId;
++    @Test
++    public void filteringPreservesPlayerBoatAndMinecartCollisionBoxes() throws Exception {
++        EntityPlayer player = player(WorldSettings.EnumGamemode.SURVIVAL);
++        EntityPlayer spectator = player(WorldSettings.EnumGamemode.SPECTATOR);
++        EntityBoat boat = allocate(EntityBoat.class);
++        EntityMinecartRideable minecart = allocate(EntityMinecartRideable.class);
++        HardBoxEntity custom = allocate(HardBoxEntity.class);
++        boat.a(new AxisAlignedBB(0, 0, 0, 1, 1, 1));
++        minecart.a(new AxisAlignedBB(0, 0, 0, 1, 1, 1));
++        custom.a(new AxisAlignedBB(0, 0, 0, 1, 1, 1));
++        List<Entity> candidates = Arrays.asList(player, spectator, boat, minecart, custom);
++        for (Entity moving : candidates) {
++            List<AxisAlignedBB> original = new ArrayList<>();
++            List<AxisAlignedBB> filtered = new ArrayList<>();
++            for (Entity candidate : candidates) {
++                if (candidate == moving) continue;
++                if (IEntitySelector.d.apply(candidate)) appendBoxes(moving, candidate, original);
++                if (World.collisionSelector(moving).apply(candidate)) appendBoxes(moving, candidate, filtered);
++            }
++            assertEquals("Filtering must preserve every hard collision box for " + moving.getClass(), original, filtered);
++        }
++        assertFalse(World.hasCollisionBox(player, player));
++        assertFalse(World.hasCollisionBox(boat, spectator));
++        assertTrue(World.hasCollisionBox(player, boat));
++        assertTrue(World.hasCollisionBox(minecart, player));
++        player.collidesWithEntities = false;
++        assertFalse(World.hasCollisionBox(minecart, player));
++    }
++
++    @Test
++    public void hardCollisionCountsFollowMembershipAndLeaveNormalQueriesIntact() throws Exception {
++        Chunk chunk = new Chunk(null, 0, 0);
++        CountingSlice slice = new CountingSlice();
++        chunk.entitySlices[0] = slice;
++        EntityPlayer player = player(WorldSettings.EnumGamemode.SURVIVAL);
++        chunk.a(player);
++        AxisAlignedBB area = new AxisAlignedBB(-1, -1, -1, 2, 2, 2);
++        List<Entity> found = new ArrayList<>();
++        Entity excluded = null;
++        chunk.a(excluded, area, found, World.HARD_COLLISIONS);
++        assertTrue(found.isEmpty());
++        assertEquals("A player-only chunk needs no hard collision scan", 0, slice.iterations);
++        chunk.a(excluded, area, found, IEntitySelector.d);
++        assertEquals(Arrays.asList(player), found);
++
++        EntityBoat boat = allocate(EntityBoat.class);
++        boat.a(new AxisAlignedBB(0, 0, 0, 1, 1, 1));
++        chunk.a(boat);
++        found.clear();
++        chunk.a(excluded, area, found, World.HARD_COLLISIONS);
++        assertEquals(Arrays.asList(boat), found);
++        chunk.b(boat);
++        chunk.b(boat);
++        slice.iterations = 0;
++        found.clear();
++        chunk.a(excluded, area, found, World.HARD_COLLISIONS);
++        assertTrue(found.isEmpty());
++        assertEquals("Removing the last hard collider restores the empty-chunk shortcut", 0, slice.iterations);
++
++        HardBoxEntity custom = allocate(HardBoxEntity.class);
++        custom.a(new AxisAlignedBB(0, 0, 0, 1, 1, 1));
++        chunk.a(custom);
++        chunk.a(excluded, area, found, World.HARD_COLLISIONS);
++        assertEquals(Arrays.asList(custom), found);
++        chunk.b(custom);
++        found.clear();
++
++        MultipartEntity parent = allocate(MultipartEntity.class);
++        parent.parts = new Entity[]{boat};
++        parent.a(new AxisAlignedBB(0, 0, 0, 1, 1, 1));
++        chunk.a(parent);
++        chunk.a(excluded, area, found, World.HARD_COLLISIONS);
++        assertEquals("Custom multipart bodies keep their child collision boxes", Arrays.asList(boat), found);
++        chunk.b(parent);
++    }
++
++    private static final class CountingSlice extends ArrayList<Entity> {
++        private int iterations;
++
++        @Override
++        public Iterator<Entity> iterator() {
++            ++this.iterations;
++            return super.iterator();
++        }
++    }
++
++    private static final class MultipartEntity extends EntityArmorStand {
++        private Entity[] parts;
++
++        private MultipartEntity() {
++            super((World) null);
++        }
++
++        @Override
++        public Entity[] aB() {
++            return this.parts;
++        }
++    }
++
++    private static final class HardBoxEntity extends EntityArmorStand {
++        private HardBoxEntity() {
++            super((World) null);
++        }
++
++        @Override
++        public AxisAlignedBB S() {
++            return this.getBoundingBox();
++        }
++    }
++
++    private static void appendBoxes(Entity moving, Entity candidate, List<AxisAlignedBB> boxes) {
++        AxisAlignedBB box = candidate.S();
++        if (box != null) boxes.add(box);
++        box = moving.j(candidate);
++        if (box != null) boxes.add(box);
++    }
++
++    private static EntityPlayer player(WorldSettings.EnumGamemode mode) throws Exception {
++        EntityPlayer player = allocate(EntityPlayer.class);
++        player.collidesWithEntities = true;
++        player.a(new AxisAlignedBB(0, 0, 0, 1, 1, 1));
++        Field manager = EntityPlayer.class.getField("playerInteractManager");
++        manager.setAccessible(true);
++        manager.set(player, new PlayerInteractManager(null));
++        Field field = PlayerInteractManager.class.getDeclaredField("gamemode");
++        field.setAccessible(true);
++        field.set(player.playerInteractManager, mode);
++        return player;
++    }
++
++    private static <T> T allocate(Class<T> type) throws Exception {
++        Class<?> unsafe = Class.forName("sun.misc.Unsafe");
++        Field field = unsafe.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        T instance = type.cast(unsafe.getMethod("allocateInstance", Class.class).invoke(field.get(null), type));
++        if (instance instanceof Entity) {
++            Field id = Entity.class.getDeclaredField("id");
++            id.setAccessible(true);
++            id.setInt(instance, ++nextEntityId);
++        }
++        return instance;
++    }
++}
