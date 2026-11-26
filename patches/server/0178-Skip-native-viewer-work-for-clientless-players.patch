@@ -1,0 +1,255 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Local Performance <local@localhost>
+Date: Thu, 26 Nov 2026 19:30:00 +0800
+Subject: [PATCH] Skip native viewer work for clientless players
+
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -1271,5 +1271,12 @@
+         return false;
+     }
+     // PandaSpigot end
++
++    // PandaSpigot start - Clientless players never receive native entity tracking packets.
++    // Overrides must remain constant for the lifetime of the entity.
++    public boolean isClientlessPlayer() {
++        return false;
++    }
++    // PandaSpigot end
+     // CraftBukkit end
+ }
+diff --git a/src/main/java/net/minecraft/server/EntityTracker.java b/src/main/java/net/minecraft/server/EntityTracker.java
+--- a/src/main/java/net/minecraft/server/EntityTracker.java
++++ b/src/main/java/net/minecraft/server/EntityTracker.java
+@@ -26,6 +26,9 @@
+         if (entity instanceof EntityPlayer) {
+             this.addEntity(entity, 512, 2);
+             EntityPlayer entityplayer = (EntityPlayer) entity;
++            // PandaSpigot start - Keep the entity, skip unused viewer subscriptions.
++            if (entityplayer.isClientlessPlayer()) return;
++            // PandaSpigot end
+             Iterator iterator = this.c.iterator();
+ 
+             while (iterator.hasNext()) {
+@@ -147,7 +150,7 @@
+ 
+     public void untrackEntity(Entity entity) {
+         org.spigotmc.AsyncCatcher.catchOp( "entity untrack"); // Spigot
+-        if (entity instanceof EntityPlayer) {
++        if (entity instanceof EntityPlayer && !((EntityPlayer) entity).isClientlessPlayer()) { // PandaSpigot
+             EntityPlayer entityplayer = (EntityPlayer) entity;
+             Iterator iterator = this.c.iterator();
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityTrackerEntry.java b/src/main/java/net/minecraft/server/EntityTrackerEntry.java
+--- a/src/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/src/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -453,6 +453,9 @@
+ 
+     public void updatePlayer(EntityPlayer entityplayer) {
+         org.spigotmc.AsyncCatcher.catchOp( "player tracker update"); // Spigot
++        // PandaSpigot start - Clientless entities never join native viewer sets.
++        if (entityplayer.isClientlessPlayer()) return;
++        // PandaSpigot end
+         if (entityplayer != this.tracker) {
+             if (this.c(entityplayer)) {
+                 if (!this.trackedPlayers.contains(entityplayer) && (this.e(entityplayer) || this.tracker.attachedToPlayer)) {
+diff --git a/src/test/java/net/minecraft/server/ClientlessEntityTrackerTest.java b/src/test/java/net/minecraft/server/ClientlessEntityTrackerTest.java
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/ClientlessEntityTrackerTest.java
+@@ -0,0 +1,194 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.util.Iterator;
++import java.util.LinkedHashSet;
++
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++import org.spigotmc.AsyncCatcher;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++
++public class ClientlessEntityTrackerTest extends AbstractTestingBase {
++    private boolean asyncCatcherEnabled;
++
++    @Before
++    public void disableAsyncCatcher() {
++        this.asyncCatcherEnabled = AsyncCatcher.enabled;
++        AsyncCatcher.enabled = false;
++    }
++
++    @After
++    public void restoreAsyncCatcher() {
++        AsyncCatcher.enabled = this.asyncCatcherEnabled;
++    }
++
++    @Test
++    public void clientlessRespawnDoesNotScanWorldViewers() throws Exception {
++        CountingEntries entries = new CountingEntries();
++        for (int index = 0; index < 1000; index++) {
++            entries.add(allocate(CountingEntry.class));
++        }
++        EntityTracker tracker = tracker(entries);
++        TestPlayer player = allocate(TestPlayer.class);
++        player.clientless = true;
++        for (int repetition = 0; repetition < 3; repetition++) {
++            entries.visits = 0;
++            tracker.untrackEntity(player);
++            System.out.println("clientless untrack entries visited: " + entries.visits);
++        }
++        assertEquals(0, entries.visits);
++    }
++
++    @Test
++    public void ordinaryUntrackedPlayerStillLeavesOtherViewerSets() throws Exception {
++        CountingEntries entries = new CountingEntries();
++        CountingEntry entry = allocate(CountingEntry.class);
++        entries.add(entry);
++
++        tracker(entries).untrackEntity(allocate(TestPlayer.class));
++
++        assertEquals(1, entries.visits);
++        assertEquals(1, entry.viewerRemovals);
++    }
++
++    @Test
++    public void clientlessPlayerOwnTrackedEntityStillGetsRemoved() throws Exception {
++        CountingEntries entries = new CountingEntries();
++        CountingEntry entry = allocate(CountingEntry.class);
++        entries.add(entry);
++        EntityTracker tracker = tracker(entries);
++        TestPlayer player = allocate(TestPlayer.class);
++        player.clientless = true;
++        tracker.trackedEntities.a(player.getId(), entry);
++
++        tracker.untrackEntity(player);
++
++        assertEquals(0, entries.visits);
++        assertEquals(0, entry.viewerRemovals);
++        assertEquals(1, entry.entityRemovals);
++        assertEquals(0, entries.size());
++        assertNull(tracker.trackedEntities.get(player.getId()));
++    }
++
++    @Test
++    public void clientlessTrackingStillRegistersItsOwnEntity() throws Exception {
++        CountingEntries entries = new CountingEntries();
++        entries.add(allocate(CountingEntry.class));
++        RegistrationTracker tracker = allocate(RegistrationTracker.class);
++        Field field = EntityTracker.class.getDeclaredField("c");
++        field.setAccessible(true);
++        field.set(tracker, entries);
++        TestPlayer player = allocate(TestPlayer.class);
++        player.clientless = true;
++
++        tracker.track(player);
++
++        assertEquals(1, tracker.registrations);
++        assertEquals(0, entries.visits);
++    }
++
++    @Test
++    public void clientlessPlayerCannotBecomeNativeViewer() throws Exception {
++        TestPlayer player = allocate(TestPlayer.class);
++        player.clientless = true;
++        allocate(EntityTrackerEntry.class).updatePlayer(player);
++    }
++
++    private static EntityTracker tracker(CountingEntries entries) throws Exception {
++        EntityTracker tracker = allocate(EntityTracker.class);
++        Field field = EntityTracker.class.getDeclaredField("c");
++        field.setAccessible(true);
++        field.set(tracker, entries);
++        tracker.trackedEntities = new IntHashMap<EntityTrackerEntry>();
++        return tracker;
++    }
++
++    private static <T> T allocate(Class<T> type) throws Exception {
++        Class<?> unsafe = Class.forName("sun.misc.Unsafe");
++        Field field = unsafe.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        return type.cast(unsafe.getMethod("allocateInstance", Class.class).invoke(field.get(null), type));
++    }
++
++    private static class TestPlayer extends EntityPlayer {
++        private boolean clientless;
++
++        private TestPlayer() {
++            super(null, null, null, null);
++        }
++
++        public boolean isClientlessPlayer() {
++            return this.clientless;
++        }
++    }
++
++    private static class RegistrationTracker extends EntityTracker {
++        private int registrations;
++
++        private RegistrationTracker() {
++            super(null);
++        }
++
++        @Override
++        public void addEntity(Entity entity, int range, int interval) {
++            this.registrations++;
++        }
++    }
++
++    private static class CountingEntry extends EntityTrackerEntry {
++        private int viewerRemovals;
++        private int entityRemovals;
++
++        private CountingEntry() {
++            super(null, 0, 0, false);
++        }
++
++        @Override
++        public void a(EntityPlayer player) {
++            this.viewerRemovals++;
++        }
++
++        @Override
++        public void a() {
++            this.entityRemovals++;
++        }
++
++        @Override
++        public int hashCode() {
++            return System.identityHashCode(this);
++        }
++
++        @Override
++        public boolean equals(Object other) {
++            return this == other;
++        }
++    }
++
++    private static class CountingEntries extends LinkedHashSet<EntityTrackerEntry> {
++        private int visits;
++
++        @Override
++        public Iterator<EntityTrackerEntry> iterator() {
++            final Iterator<EntityTrackerEntry> delegate = super.iterator();
++            return new Iterator<EntityTrackerEntry>() {
++                public boolean hasNext() {
++                    return delegate.hasNext();
++                }
++
++                public EntityTrackerEntry next() {
++                    visits++;
++                    return delegate.next();
++                }
++
++                public void remove() {
++                    delegate.remove();
++                }
++            };
++        }
++    }
++}
